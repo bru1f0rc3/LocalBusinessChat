@@ -2305,7 +2305,7 @@ impl App {
                             ui.label(RichText::new("При возвращении к компьютеру прежнее состояние восстанавливается.").small().weak());
                         }
                         7 => {
-                            ui.label("Папка, в которой лежат Emoticons\\ и Sounds\\ (например, папка установки оригинального Nassi):");
+                            ui.label("Папка, в которой лежат Emoticons\\ и Sounds\\ (по умолчанию — папка программы):");
                             ui.horizontal(|ui| {
                                 ui.add(egui::TextEdit::singleline(&mut d.assets_dir).desired_width(340.0).hint_text("авто"));
                                 if ui.button("Обзор…").clicked() {

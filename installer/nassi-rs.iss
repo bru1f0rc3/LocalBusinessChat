@@ -8,7 +8,7 @@
 #define AppVersion "0.1.0"
 #define AppExe "NassiRS.exe"
 #define Root ".."
-#define Assets "..\.."
+#define Assets ".."
 
 [Setup]
 AppId={{8F3A2C61-5B7E-4D2A-9C1F-3E6B7A9D0C42}
@@ -51,7 +51,7 @@ Name: "firewall"; Description: "Разрешить Nassi RS в брандмау�
 Source: "{#Root}\target\dist\x86_64-pc-windows-msvc\release\nassi-rs.exe"; DestDir: "{app}"; DestName: "{#AppExe}"; Check: Is64BitInstallMode; Flags: ignoreversion
 ; x86 Windows -> 32-bit build
 Source: "{#Root}\target\dist\i686-pc-windows-msvc\release\nassi-rs.exe"; DestDir: "{app}"; DestName: "{#AppExe}"; Check: not Is64BitInstallMode; Flags: ignoreversion
-; emoticons and sounds (picked up from the program folder)
+; emoticons and sounds from the project folder (picked up next to the exe)
 Source: "{#Assets}\Emoticons\*"; DestDir: "{app}\Emoticons"; Flags: recursesubdirs createallsubdirs ignoreversion
 Source: "{#Assets}\Sounds\*"; DestDir: "{app}\Sounds"; Flags: ignoreversion
 Source: "{#Root}\README.md"; DestDir: "{app}"; DestName: "README.txt"; Flags: ignoreversion

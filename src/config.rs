@@ -327,7 +327,7 @@ impl Paths {
     }
 
     /// Folder with Emoticons/ and Sounds/: explicit setting, else the exe folder
-    /// or one of its parents (so the original Nassi install folder is picked up).
+    /// or one of its parents (installed: the program folder; development: the project root).
     pub fn find_assets(cfg: &Config) -> Option<PathBuf> {
         if !cfg.assets_dir.trim().is_empty() {
             let p = PathBuf::from(cfg.assets_dir.trim());
