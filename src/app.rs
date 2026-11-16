@@ -21,8 +21,45 @@ use std::time::{Duration, Instant};
 pub enum Page {
     Users,
     Chat,
+    Private,
     Groups,
     Events,
+}
+
+/// Search inside one conversation (magnifier in the top right corner of a chat).
+#[derive(Default)]
+pub struct ChatSearch {
+    pub open: bool,
+    pub query: String,
+    /// index into the list of matches (oldest first)
+    pub cur: usize,
+    /// the query the matches were computed for (to reset `cur` when it changes)
+    pub last_query: String,
+    pub focus: bool,
+    /// scroll to the current match on the next frame
+    pub scroll: bool,
+    /// show only the matching messages
+    pub only: bool,
+    /// jump to this message id once matches are known
+    pub jump_to: Option<u64>,
+}
+
+impl ChatSearch {
+    pub fn active(&self) -> bool {
+        self.open && !self.query.trim().is_empty()
+    }
+    pub fn toggle(&mut self) {
+        self.open = !self.open;
+        self.focus = self.open;
+        if !self.open {
+            self.query.clear();
+            self.last_query.clear();
+        }
+    }
+    pub fn start(&mut self) {
+        self.open = true;
+        self.focus = true;
+    }
 }
 
 /// A group conversation ("беседа").
@@ -34,6 +71,7 @@ pub struct Conv {
     pub input: ChatInput,
     pub dirty: bool,
     pub meta_dirty: bool,
+    pub search: ChatSearch,
 }
 
 impl Conv {
@@ -107,7 +145,7 @@ pub struct PrivateChat {
     pub uid: u64,
     pub lines: Vec<Line>,
     pub ids: HashSet<u64>,
-    pub open: bool,
+    pub search: ChatSearch,
     pub input: ChatInput,
     pub unread: u32,
     pub dirty: bool,
@@ -198,6 +236,7 @@ pub struct Tip {
     pub text: String,
     pub until: Instant,
     pub chat_uid: Option<u64>,
+    pub group: Option<u64>,
 }
 
 #[derive(Default)]
@@ -216,6 +255,8 @@ pub struct Dialogs {
     pub connect: Option<ConnectDlg>,
     /// (uid, action) waiting for confirmation
     pub power: Option<(u64, u8, String)>,
+    /// "clear private history with uid?" confirmation
+    pub clear_chat: Option<u64>,
 }
 
 pub struct App {
@@ -242,6 +283,18 @@ pub struct App {
     pub global_ids: HashSet<u64>,
     pub global_input: ChatInput,
     pub global_unread: bool,
+    pub global_search: ChatSearch,
+    /// "Личные сообщения": selected dialog and the search box above the dialog list
+    pub private_sel: Option<u64>,
+    pub dm_filter: String,
+    pub dm_filter_focus: bool,
+    /// search box of the users list
+    pub users_filter: String,
+    pub users_filter_focus: bool,
+    /// a message came while I was away: blink the taskbar button / tray icon until I am back
+    pub alert: bool,
+    pub alert_since: Instant,
+    pub alert_flashing: bool,
     pub chats: HashMap<u64, PrivateChat>,
     pub groups: BTreeMap<u64, Conv>,
     pub group_sel: Option<u64>,
@@ -351,6 +404,15 @@ impl App {
             global_ids: HashSet::new(),
             global_input: ChatInput::default(),
             global_unread: false,
+            global_search: ChatSearch::default(),
+            private_sel: None,
+            dm_filter: String::new(),
+            dm_filter_focus: false,
+            users_filter: String::new(),
+            users_filter_focus: false,
+            alert: false,
+            alert_since: Instant::now(),
+            alert_flashing: false,
             chats: HashMap::new(),
             groups: BTreeMap::new(),
             group_sel: None,
@@ -431,7 +493,7 @@ impl App {
                 let Some(info) = std::fs::read_to_string(&p).ok().and_then(|s| serde_json::from_str::<GroupInfo>(&s).ok()) else { continue };
                 let lines = read_jsonl(&p.with_extension("jsonl"), usize::MAX);
                 let ids = lines.iter().map(|l| l.id).collect();
-                app.groups.insert(info.id, Conv { info, lines, ids, unread: 0, input: ChatInput::default(), dirty: false, meta_dirty: false });
+                app.groups.insert(info.id, Conv { info, lines, ids, unread: 0, input: ChatInput::default(), dirty: false, meta_dirty: false, search: ChatSearch::default() });
             }
         }
 
@@ -524,15 +586,94 @@ impl App {
             return;
         }
         let until = Instant::now() + Duration::from_secs(self.cfg.general.tip_secs.max(1) as u64);
-        self.tips.push_back(Tip { title: title.into(), text: text.into(), until, chat_uid });
+        self.tips.push_back(Tip { title: title.into(), text: text.into(), until, chat_uid, group: None });
         while self.tips.len() > 4 {
             self.tips.pop_front();
         }
     }
 
-    pub fn attention(&self) {
-        if !self.focused {
-            self.ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
+    pub fn tip_group(&mut self, title: impl Into<String>, text: impl Into<String>, group: u64) {
+        self.tip(title, text, None);
+        if let Some(t) = self.tips.back_mut() {
+            t.group = Some(group);
+        }
+    }
+
+    /// Am I away from the window: it is not active, hidden in the tray, minimized,
+    /// or nobody has touched the keyboard/mouse for a while.
+    pub fn user_away(&self) -> bool {
+        !self.focused || !self.visible || self.minimized || crate::platform::idle_secs() >= self.cfg.general.away_secs.max(5)
+    }
+
+    /// Something arrived (a message in any chat, a signal, a file): if I am away, the
+    /// application starts blinking (taskbar button + tray icon) until I come back.
+    pub fn attention(&mut self) {
+        if !self.cfg.general.flash_on_message || !self.user_away() {
+            return;
+        }
+        if !self.alert {
+            self.alert = true;
+            self.alert_since = Instant::now();
+        }
+        self.start_flash();
+    }
+
+    fn main_hwnd(&self) -> Option<isize> {
+        let h = self.tray.as_ref().map(|t| t.hwnd.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
+        if h != 0 {
+            return Some(h);
+        }
+        let h = crate::platform::find_main_window()?;
+        if let Some(t) = &self.tray {
+            t.hwnd.store(h, std::sync::atomic::Ordering::Relaxed);
+        }
+        Some(h)
+    }
+
+    fn start_flash(&mut self) {
+        if !self.visible {
+            return; // in the tray: only the tray icon blinks (see update_alert)
+        }
+        match self.main_hwnd() {
+            Some(h) if cfg!(windows) => crate::platform::flash_window(h, true),
+            _ => self.ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical)),
+        }
+        self.alert_flashing = true;
+    }
+
+    /// Called every frame: stop blinking once I am back at the active window,
+    /// keep the tray icon blinking meanwhile.
+    pub fn update_alert(&mut self) {
+        if !self.alert {
+            return;
+        }
+        let back = self.focused && self.visible && !self.minimized && crate::platform::idle_secs() < 2 && self.alert_since.elapsed() > Duration::from_millis(700);
+        if back || !self.cfg.general.flash_on_message {
+            self.stop_alert();
+            return;
+        }
+        if self.visible && !self.alert_flashing {
+            // came out of the tray without becoming active: blink the taskbar button too
+            self.start_flash();
+        }
+        let on = (self.alert_since.elapsed().as_millis() / 500) % 2 == 0;
+        if let Some(t) = &self.tray {
+            t.set_alert(on);
+        }
+        self.ctx.request_repaint_after(Duration::from_millis(250));
+    }
+
+    pub fn stop_alert(&mut self) {
+        self.alert = false;
+        if self.alert_flashing {
+            if let Some(h) = self.main_hwnd() {
+                crate::platform::flash_window(h, false);
+            }
+            self.ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Reset));
+            self.alert_flashing = false;
+        }
+        if let Some(t) = &self.tray {
+            t.set_alert(false);
         }
     }
 
@@ -961,16 +1102,15 @@ impl App {
                 };
                 let line = Line { id, time: now_unix(), from, nick: nick.clone(), color, text: text.clone(), me, delivered: true, pending: Vec::new() };
                 self.push_global(line);
-                if self.page != Page::Chat || !self.focused {
+                if self.page != Page::Chat || self.user_away() {
                     self.global_unread = true;
                 }
                 self.play(if me { "me" } else { "global" });
-                self.tip(format!("Global Chat — {nick}"), text, None);
+                self.tip(format!("Общий чат — {nick}"), text, None);
                 let _ = comp;
+                self.attention();
                 if self.cfg.general.popup_on_global && !self.cfg.cur_state().no_popups {
                     self.show_main();
-                } else {
-                    self.attention();
                 }
             }
             Body::Private { id, text, sent } => {
@@ -981,26 +1121,25 @@ impl App {
                     Some(p) => (p.p.nick.clone(), p.p.color),
                     None => (self.peer_name(from), [90, 90, 90]),
                 };
+                let reading = self.page == Page::Private && self.private_sel == Some(from) && !self.user_away();
                 let chat = self.chat_mut(from);
                 if !chat.ids.insert(id) {
                     return; // duplicate (resend)
                 }
                 let line = Line { id, time: sent, from, nick: nick.clone(), color, text: text.clone(), me: false, delivered: true, pending: Vec::new() };
                 chat.lines.push(line.clone());
-                let popup = !chat.open;
-                chat.unread += 1;
+                if !reading {
+                    chat.unread += 1;
+                }
                 let path = self.chat_path(from);
                 append_jsonl(&path, &line);
-                if popup && self.cfg.general.popup_on_private && !self.cfg.cur_state().no_popups {
-                    self.chat_mut(from).open = true;
-                    self.show_main();
-                } else if popup {
-                    // open the window anyway (inside the app) so nothing gets lost
-                    self.chat_mut(from).open = true;
-                }
                 self.play("private");
-                self.tip(format!("Личное — {nick}"), text, Some(from));
+                self.tip(format!("Личное сообщение — {nick}"), text, Some(from));
                 self.attention();
+                if self.cfg.general.popup_on_private && !self.cfg.cur_state().no_popups && !self.focused {
+                    self.show_main();
+                    self.open_chat(from);
+                }
                 self.auto_answer(from);
             }
             Body::PrivateAck(id) => {
@@ -1158,7 +1297,7 @@ impl App {
             title.trim().to_string()
         };
         let info = GroupInfo { id, title: title.clone(), owner: self.cfg.uid, names: self.names_for(&members), members, rev: now_ms() };
-        self.groups.insert(id, Conv { info, lines: Vec::new(), ids: HashSet::new(), unread: 0, input: ChatInput::default(), dirty: true, meta_dirty: true });
+        self.groups.insert(id, Conv { info, lines: Vec::new(), ids: HashSet::new(), unread: 0, input: ChatInput::default(), dirty: true, meta_dirty: true, search: ChatSearch::default() });
         self.group_system(id, format!("{} создал(а) беседу «{title}»", self.cfg.nick));
         self.push_group_info(id, &[]);
         self.group_sel = Some(id);
@@ -1342,7 +1481,7 @@ impl App {
                 }
                 let who = info.name_of(from).map(|s| s.to_string()).unwrap_or_else(|| self.peer_name(from));
                 let title = info.title.clone();
-                self.groups.insert(id, Conv { info, lines: Vec::new(), ids: HashSet::new(), unread: 1, input: ChatInput::default(), dirty: true, meta_dirty: true });
+                self.groups.insert(id, Conv { info, lines: Vec::new(), ids: HashSet::new(), unread: 1, input: ChatInput::default(), dirty: true, meta_dirty: true, search: ChatSearch::default() });
                 self.group_system(id, format!("{who} пригласил(а) вас в беседу «{title}»"));
                 self.log(Level::Info, "Беседы", format!("{who} пригласил(а) вас в беседу «{title}»"));
                 self.play("private");
@@ -1367,13 +1506,13 @@ impl App {
         if !self.groups.contains_key(&conv) {
             // unknown yet: placeholder until GroupInfo arrives
             let info = GroupInfo { id: conv, title: "Беседа".into(), owner: from, members: vec![from, my], names: self.names_for(&[from, my]), rev: 0 };
-            self.groups.insert(conv, Conv { info, lines: Vec::new(), ids: HashSet::new(), unread: 0, input: ChatInput::default(), dirty: true, meta_dirty: true });
+            self.groups.insert(conv, Conv { info, lines: Vec::new(), ids: HashSet::new(), unread: 0, input: ChatInput::default(), dirty: true, meta_dirty: true, search: ChatSearch::default() });
         }
         let (nick, color) = match self.peers.get(&from) {
             Some(p) => (p.p.nick.clone(), p.p.color),
             None => (self.peer_name(from), [90, 90, 90]),
         };
-        let selected = self.page == Page::Groups && self.group_sel == Some(conv) && self.focused;
+        let selected = self.page == Page::Groups && self.group_sel == Some(conv) && !self.user_away();
         let c = self.groups.get_mut(&conv).unwrap();
         if !c.is_member(my) && known_rev.is_some_and(|r| rev <= r) {
             return; // I was removed; sender has stale info (they get my GroupInfo via query)
@@ -1393,7 +1532,7 @@ impl App {
         let path = self.group_path(conv).with_extension("jsonl");
         append_jsonl(&path, &line);
         self.play("global");
-        self.tip(format!("{title} — {nick}"), text, None);
+        self.tip_group(format!("{title} — {nick}"), text, conv);
         self.attention();
     }
 
@@ -1483,8 +1622,10 @@ impl App {
             return;
         }
         let c = self.chat_mut(uid);
-        c.open = true;
+        c.unread = 0;
         c.input.focus = true;
+        self.private_sel = Some(uid);
+        self.page = Page::Private;
     }
 
     fn rewrite_chat(&mut self, uid: u64) {
@@ -2020,13 +2161,16 @@ impl PrivateChat {
             uid,
             lines,
             ids,
-            open: false,
+            search: ChatSearch::default(),
             input: ChatInput::default(),
             unread: 0,
             dirty: false,
             last_auto_answer: None,
             last_typing_sent: None,
         }
+    }
+    pub fn empty(uid: u64) -> Self {
+        Self::new(uid, Vec::new(), HashSet::new())
     }
     pub fn pending_count(&self) -> usize {
         self.lines.iter().filter(|l| !l.delivered && l.from != self.uid).count()

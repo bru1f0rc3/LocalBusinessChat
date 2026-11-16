@@ -5,3 +5,10 @@ rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.i686-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# Windows 7 SP1 / 8 / 8.1 builds (tier 3 targets: nightly + -Zbuild-std, see installer/build-installer.ps1).
+[target.x86_64-win7-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-win7-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

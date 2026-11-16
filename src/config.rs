@@ -38,9 +38,9 @@ impl ClickAction {
     pub fn title(self) -> &'static str {
         match self {
             ClickAction::None => "Ничего",
-            ClickAction::PrivateChat => "Личный чат",
+            ClickAction::PrivateChat => "Личное сообщение",
             ClickAction::Info => "Информация",
-            ClickAction::Appeal => "Обращение в Global Chat",
+            ClickAction::Appeal => "Обращение в общем чате",
             ClickAction::Signal => "Сигнал",
             ClickAction::SendFile => "Отправить файл",
         }
@@ -62,6 +62,10 @@ pub struct GeneralCfg {
     pub click_actions: [ClickAction; 4],
     pub ui_scale: f32,
     pub start_minimized: bool,
+    /// blink the taskbar button / tray icon when a message arrives while I am away
+    pub flash_on_message: bool,
+    /// seconds without keyboard/mouse input after which I count as "away from the computer"
+    pub away_secs: u32,
 }
 
 impl Default for GeneralCfg {
@@ -77,6 +81,8 @@ impl Default for GeneralCfg {
             click_actions: [ClickAction::PrivateChat, ClickAction::Info, ClickAction::SendFile, ClickAction::Appeal],
             ui_scale: 1.0,
             start_minimized: false,
+            flash_on_message: true,
+            away_secs: 30,
         }
     }
 }
@@ -84,7 +90,8 @@ impl Default for GeneralCfg {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct PrivacyCfg {
-    /// true: privacy mode in all states; false: only in the "Private" state
+    /// true: the restrictions below apply in all states; false: only in the "Private" state.
+    /// In the "Private" state everything (active window, processes, screen, clipboard) is hidden anyway.
     pub global: bool,
     pub no_fg_title: bool,
     pub no_processes: bool,
@@ -132,8 +139,8 @@ pub struct SoundCfg {
 }
 
 pub const SOUND_EVENTS: [(&str, &str, &str); 9] = [
-    ("global", "Фраза в Global Chat", "chat.wav"),
-    ("me", "Фраза /me", "me.wav"),
+    ("global", "Сообщение в общем чате", "chat.wav"),
+    ("me", "Действие /me", "me.wav"),
     ("private", "Личное сообщение", "message.wav"),
     ("signal", "Сигнал", "signal.wav"),
     ("user_join", "Пользователь появился", "user_join.wav"),
@@ -403,6 +410,9 @@ impl Config {
         if self.nick.trim().is_empty() {
             self.nick = def.nick;
         }
+        if self.general.away_secs == 0 {
+            self.general.away_secs = 30;
+        }
         if !(0.5..=3.0).contains(&self.general.ui_scale) {
             self.general.ui_scale = 1.0;
         }
@@ -426,14 +436,20 @@ impl Config {
         self.privacy.global || self.state == ST_PRIVATE
     }
 
+    /// "Приватный" state: full privacy, regardless of the check boxes.
+    pub fn private_state(&self) -> bool {
+        self.state == ST_PRIVATE
+    }
+
     pub fn effective_allow(&self) -> crate::proto::Allow {
         let p = &self.privacy;
         let on = self.privacy_active();
+        let full = self.private_state();
         crate::proto::Allow {
-            fg_title: !(on && p.no_fg_title),
-            processes: !(on && p.no_processes),
-            screenshot: !(on && p.no_screenshot),
-            clipboard: !(on && p.no_clipboard),
+            fg_title: !(full || (on && p.no_fg_title)),
+            processes: !(full || (on && p.no_processes)),
+            screenshot: !(full || (on && p.no_screenshot)),
+            clipboard: !(full || (on && p.no_clipboard)),
             remote_kill: !p.no_remote_kill,
             // remote access is always on and protected by the built-in admin password
             remote: 2,

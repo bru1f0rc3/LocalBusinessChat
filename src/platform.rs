@@ -375,6 +375,20 @@ mod win {
         (h != 0).then_some(h)
     }
 
+    /// Blink the taskbar button and the caption until `on == false` (FLASHW_STOP).
+    pub fn flash_window(hwnd: isize, on: bool) {
+        let fi = FLASHWINFO {
+            cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+            hwnd: hwnd as HWND,
+            dwFlags: if on { FLASHW_ALL | FLASHW_TIMER } else { FLASHW_STOP },
+            uCount: if on { u32::MAX } else { 0 },
+            dwTimeout: 0,
+        };
+        unsafe {
+            FlashWindowEx(&fi);
+        }
+    }
+
     /// "Tray mode" without hiding the window: a hidden (SW_HIDE) window gets no
     /// WM_PAINT, which would freeze the egui loop and with it all message
     /// processing. Instead the window becomes fully transparent, click-through
@@ -423,6 +437,7 @@ mod stub {
     pub fn play_wav(_p: &std::path::Path) {}
     pub fn find_main_window() -> Option<isize> { None }
     pub fn set_stealth(_h: isize, _on: bool) {}
+    pub fn flash_window(_h: isize, _on: bool) {}
     pub fn is_stealth(_h: isize) -> bool { true }
     pub fn capture(_m: usize) -> Result<(image::RgbaImage, i32, i32, usize), String> { Err("unsupported".into()) }
     pub fn inject_mouse_move(_x: i32, _y: i32) {}

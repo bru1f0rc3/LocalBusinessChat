@@ -1,6 +1,6 @@
 ﻿[package]
 name = "nassi-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Serverless LAN messenger (users list, global chat, private chats, file transfer) - a Rust re-implementation inspired by Network Assistant"
 license = "MIT"
@@ -39,6 +39,15 @@ windows-sys = { version = "0.59", features = [
     "Win32_Graphics_Gdi",
     "Win32_Media_Audio",
 ] }
+
+# windows-targets 0.48 picks its import library by the exact target name, so the
+# *-win7-windows-msvc builds (Windows 7/8.1, see installer/build-installer.ps1) would not
+# find windows.0.48.5.lib. Depending on these crates directly adds their lib folder.
+[target.'cfg(all(windows, target_env = "msvc", target_arch = "x86_64"))'.dependencies]
+windows_x86_64_msvc = "=0.48.5"
+
+[target.'cfg(all(windows, target_env = "msvc", target_arch = "x86"))'.dependencies]
+windows_i686_msvc = "=0.48.5"
 
 [build-dependencies]
 winresource = "0.1"

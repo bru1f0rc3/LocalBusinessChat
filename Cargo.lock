@@ -2243,7 +2243,7 @@ dependencies = [
 
 [[package]]
 name = "nassi-rs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arboard",
  "bincode",
@@ -2262,6 +2262,8 @@ dependencies = [
  "socket2",
  "tray-icon",
  "windows-sys 0.59.0",
+ "windows_i686_msvc 0.48.5",
+ "windows_x86_64_msvc 0.48.5",
  "winresource",
 ]
 

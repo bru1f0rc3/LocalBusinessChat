@@ -8,6 +8,9 @@ use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIc
 
 pub struct Tray {
     icon: TrayIcon,
+    normal: Option<tray_icon::Icon>,
+    alert_icon: Option<tray_icon::Icon>,
+    alert_on: AtomicBool,
     pub show_requested: Arc<AtomicBool>,
     pub quit_requested: Arc<AtomicBool>,
     /// main window handle (0 = unknown), used to leave "stealth" tray mode
@@ -27,9 +30,33 @@ fn restore(ctx: &egui::Context, hwnd: &AtomicIsize, show: &AtomicBool) {
     ctx.request_repaint();
 }
 
+/// The app icon with a big red "new message" dot in the bottom-right corner.
+fn alert_rgba(src: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
+    if src.len() != (w * h * 4) as usize || w == 0 || h == 0 {
+        return None;
+    }
+    let mut v = src.to_vec();
+    let r = w.min(h) as f32 * 0.30;
+    let (cx, cy) = (w as f32 - r - 0.5, h as f32 - r - 0.5);
+    for y in 0..h {
+        for x in 0..w {
+            let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+            let i = ((y * w + x) * 4) as usize;
+            if d <= r - 1.0 {
+                v[i..i + 4].copy_from_slice(&[230, 40, 40, 255]);
+            } else if d <= r + 0.5 {
+                v[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+        }
+    }
+    Some(v)
+}
+
 impl Tray {
     pub fn new(ctx: &egui::Context) -> Option<Tray> {
         let data = crate::icons::Icons::app_icon()?;
+        let alert_icon = alert_rgba(&data.rgba, data.width, data.height).and_then(|v| tray_icon::Icon::from_rgba(v, data.width, data.height).ok());
+        let normal = tray_icon::Icon::from_rgba(data.rgba.clone(), data.width, data.height).ok();
         let icon = tray_icon::Icon::from_rgba(data.rgba, data.width, data.height).ok()?;
         let menu = Menu::new();
         let open = MenuItem::new("Открыть Nassi RS", true, None);
@@ -71,7 +98,19 @@ impl Tray {
                 ctx.request_repaint();
             }));
         }
-        Some(Tray { icon: tray, show_requested: show, quit_requested: quit_flag, hwnd })
+        Some(Tray { icon: tray, normal, alert_icon, alert_on: AtomicBool::new(false), show_requested: show, quit_requested: quit_flag, hwnd })
+    }
+
+    /// Switch between the normal icon and the "new message" icon (called on every
+    /// blink phase; does nothing when the state does not change).
+    pub fn set_alert(&self, on: bool) {
+        if self.alert_on.swap(on, Ordering::Relaxed) == on {
+            return;
+        }
+        let icon = if on { self.alert_icon.clone() } else { self.normal.clone() };
+        if icon.is_some() {
+            let _ = self.icon.set_icon(icon);
+        }
     }
 
     pub fn set_tooltip(&self, s: &str) {

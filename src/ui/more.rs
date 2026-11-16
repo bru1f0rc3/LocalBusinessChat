@@ -1,7 +1,7 @@
 //! Group chat page, remote desktop viewer windows, host-side prompts/indicator,
 //! command line windows and related dialogs.
 
-use super::{chat_input, chat_lines, header_bar, tool_button, Act};
+use super::{chat_input, chat_lines, header_bar, search_bar, search_icon_button, search_matches, sync_search, tool_button, Act, Highlight};
 use crate::app::*;
 use crate::config::*;
 use eframe::egui::{self, load::SizedTexture, Color32, Key, RichText, Sense};
@@ -11,7 +11,7 @@ use std::time::Duration;
 impl App {
     pub(super) fn groups_page(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) -> bool {
         let my = self.cfg.uid;
-        header_bar(ui, self.icons.get("hd_chat"), "Group Chat", &format!("бесед: {}", self.groups.len()));
+        header_bar(ui, self.icons.get("hd_chat"), "Групповой чат", &format!("бесед: {}", self.groups.len()));
         let font = self.cfg.chat.font_size;
         egui::SidePanel::left("conv_list").resizable(true).default_width(210.0).show_inside(ui, |ui| {
             ui.add_space(4.0);
@@ -103,7 +103,7 @@ impl App {
                         acts.push(Act::Chat(u));
                     }
                     r.context_menu(|ui| {
-                        if ui.button("Личный чат").clicked() {
+                        if ui.button("Написать личное сообщение").clicked() {
                             acts.push(Act::Chat(u));
                             ui.close_menu();
                         }
@@ -152,7 +152,8 @@ impl App {
         let nicks: Vec<String> = self.peers.values().map(|p| p.p.nick.clone()).collect();
         let emo_icon = self.icons.sized("tb_emoticon", 22.0);
         let emo = if self.cfg.chat.no_emoticons { None } else { self.emo.as_ref() };
-        let focused = self.focused;
+        let focused = !self.user_away();
+        let show_system = self.cfg.chat.show_system;
         let macros = &mut self.cfg.chat.macros;
         let c = self.groups.get_mut(&id).unwrap();
         if focused {
@@ -172,14 +173,29 @@ impl App {
         });
         let mut animated = false;
         egui::CentralPanel::default().frame(egui::Frame::none().fill(Color32::WHITE).inner_margin(6.0)).show_inside(ui, |ui| {
-            ui.label(RichText::new(&c.info.title).strong().size(16.0));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&c.info.title).strong().size(16.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if search_icon_button(ui, c.search.open, Color32::from_gray(70)).clicked() {
+                        c.search.toggle();
+                    }
+                });
+            });
+            let (needle, matches) = search_matches(&c.lines, &c.search);
+            sync_search(&mut c.search, &c.lines, &matches);
+            if c.search.open {
+                search_bar(ui, &mut c.search, ("conv_search", id), matches.len());
+            }
             ui.separator();
-            egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
-                animated = chat_lines(ui, &c.lines, emo, my, font, true, true);
+            let searching = !needle.is_empty();
+            let mut hl = Highlight { current: matches.get(c.search.cur).map(|i| c.lines[*i].id), needle, scroll: c.search.scroll, only: c.search.only };
+            egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(!searching).show(ui, |ui| {
+                animated = chat_lines(ui, &c.lines, emo, my, font, true, show_system, &mut hl);
                 if c.lines.is_empty() {
                     ui.label(RichText::new("Сообщения видят только участники беседы.").weak());
                 }
             });
+            c.search.scroll = hl.scroll;
         });
         animated
     }
@@ -249,7 +265,7 @@ impl App {
             egui::Window::new("Переименовать беседу").collapsible(false).resizable(false).show(ctx, |ui| {
                 ui.text_edit_singleline(title).request_focus();
                 ui.horizontal(|ui| {
-                    if ui.button("OK").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                    if ui.button("ОК").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
                         done = Some(true);
                     }
                     if ui.button("Отмена").clicked() {

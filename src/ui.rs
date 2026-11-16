@@ -12,6 +12,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 mod more;
+mod private;
 
 const VIEWBAR_BG: Color32 = Color32::from_rgb(0x6e, 0x6e, 0x6e);
 const HEADER_BG: Color32 = Color32::from_rgb(0x8c, 0x8c, 0x8c);
@@ -56,6 +57,10 @@ enum Act {
     Power(u64, u8),
     RenameConv(u64),
     DeleteConv(u64),
+    /// open a private chat and jump to a found message
+    JumpPrivate(u64, u64),
+    /// deselect the private chat (back to the dialog list)
+    CloseDm,
 }
 
 /// Toolbar button with clear feedback: highlight on hover, "pressed in" look while
@@ -116,6 +121,11 @@ fn c32(c: [u8; 3]) -> Color32 {
 }
 
 fn header_bar(ui: &mut egui::Ui, icon: Option<SizedTexture>, title: &str, right: &str) {
+    header_bar_ex(ui, icon, title, right, |_| {});
+}
+
+/// Header with extra widgets on the right (laid out right to left: `extra` first).
+fn header_bar_ex(ui: &mut egui::Ui, icon: Option<SizedTexture>, title: &str, right: &str, extra: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::none().fill(HEADER_BG).inner_margin(egui::Margin::symmetric(6.0, 3.0)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
@@ -124,14 +134,182 @@ fn header_bar(ui: &mut egui::Ui, icon: Option<SizedTexture>, title: &str, right:
             }
             ui.label(RichText::new(title).color(Color32::WHITE).strong().size(16.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                extra(ui);
                 ui.label(RichText::new(right).color(Color32::WHITE).size(12.0));
             });
         });
     });
 }
 
+/// Magnifier button (painted, so it does not depend on fonts).
+pub fn search_icon_button(ui: &mut egui::Ui, active: bool, color: Color32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 24.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        if active || resp.hovered() {
+            let a = if resp.is_pointer_button_down_on() { 90 } else if active { 70 } else { 45 };
+            let bg = if color == Color32::WHITE { Color32::from_rgba_unmultiplied(255, 255, 255, a) } else { Color32::from_rgba_unmultiplied(0, 0, 0, a / 3) };
+            p.rect_filled(rect, 4.0f32, bg);
+        }
+        let c = rect.center() + egui::vec2(-2.0, -2.0);
+        let stroke = egui::Stroke::new(2.0f32, color);
+        p.circle_stroke(c, 6.0, stroke);
+        p.line_segment([c + egui::vec2(4.4, 4.4), c + egui::vec2(9.0, 9.0)], egui::Stroke::new(2.6f32, color));
+    }
+    resp.on_hover_text("Поиск по сообщениям (Ctrl+F)")
+}
+
+// ------------------------------------------------------------------ search
+
+/// Lowercase for search; «ё» is treated as «е».
+fn lc(c: char) -> char {
+    let c = c.to_lowercase().next().unwrap_or(c);
+    if c == 'ё' {
+        'е'
+    } else {
+        c
+    }
+}
+
+pub fn lower_chars(s: &str) -> Vec<char> {
+    s.trim().chars().map(lc).collect()
+}
+
+/// Byte ranges of case-insensitive occurrences of `needle` (from `lower_chars`) in `hay`.
+pub fn find_ci(hay: &str, needle: &[char]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    if needle.is_empty() {
+        return out;
+    }
+    let hc: Vec<(usize, char)> = hay.char_indices().map(|(i, c)| (i, lc(c))).collect();
+    let mut i = 0;
+    while i + needle.len() <= hc.len() {
+        if hc[i..i + needle.len()].iter().zip(needle).all(|(a, b)| a.1 == *b) {
+            let end = hc.get(i + needle.len()).map(|x| x.0).unwrap_or(hay.len());
+            out.push((hc[i].0, end));
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+pub fn contains_ci(hay: &str, needle: &[char]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let hc: Vec<char> = hay.chars().map(lc).collect();
+    hc.windows(needle.len()).any(|w| w == needle)
+}
+
+/// What `chat_lines` should highlight.
+#[derive(Default)]
+pub struct Highlight {
+    pub needle: Vec<char>,
+    pub current: Option<u64>,
+    pub scroll: bool,
+    pub only: bool,
+}
+
+/// Indices of the lines that match the search (oldest first).
+pub fn search_matches(lines: &[Line], s: &ChatSearch) -> (Vec<char>, Vec<usize>) {
+    if !s.active() {
+        return (Vec::new(), Vec::new());
+    }
+    let needle = lower_chars(&s.query);
+    let m = lines.iter().enumerate().filter(|(_, l)| l.from != 0 && contains_ci(&l.text, &needle)).map(|(i, _)| i).collect();
+    (needle, m)
+}
+
+/// Keep the current match valid: a new query starts from the newest match,
+/// `jump_to` selects a given message.
+pub fn sync_search(s: &mut ChatSearch, lines: &[Line], matches: &[usize]) {
+    if s.query != s.last_query {
+        s.last_query = s.query.clone();
+        s.cur = matches.len().saturating_sub(1);
+        s.scroll = !matches.is_empty();
+    }
+    if let Some(id) = s.jump_to {
+        if let Some(k) = matches.iter().position(|i| lines[*i].id == id) {
+            s.cur = k;
+            s.scroll = true;
+            s.jump_to = None;
+        } else if !s.active() {
+            s.jump_to = None;
+        }
+    }
+    if s.cur >= matches.len() {
+        s.cur = matches.len().saturating_sub(1);
+    }
+}
+
+/// Telegram-like search strip under a chat header: query, "N из M", ▲/▼, close.
+/// Enter / ▲ — earlier message, Shift+Enter / ▼ — later one, Esc — close.
+pub fn search_bar(ui: &mut egui::Ui, s: &mut ChatSearch, id_src: impl std::hash::Hash, total: usize) {
+    egui::Frame::none().fill(Color32::from_rgb(0xee, 0xf3, 0xf8)).inner_margin(egui::Margin::symmetric(6.0, 4.0)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            let id = egui::Id::new(id_src);
+            let (mut up, mut down, mut close) = (false, false, false);
+            if ui.memory(|m| m.has_focus(id)) {
+                ui.input_mut(|i| {
+                    if i.consume_key(Modifiers::SHIFT, Key::Enter) || i.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                        down = true;
+                    }
+                    if i.consume_key(Modifiers::NONE, Key::Enter) || i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                        up = true;
+                    }
+                    if i.consume_key(Modifiers::NONE, Key::Escape) {
+                        close = true;
+                    }
+                });
+            }
+            let w = (ui.available_width() - 290.0).clamp(120.0, 420.0);
+            let r = ui.add(egui::TextEdit::singleline(&mut s.query).id(id).hint_text("🔍 Поиск по сообщениям…").desired_width(w));
+            if s.focus {
+                r.request_focus();
+                s.focus = false;
+            }
+            let has_q = !s.query.trim().is_empty();
+            let status = if !has_q {
+                String::new()
+            } else if total == 0 {
+                "ничего не найдено".to_string()
+            } else {
+                format!("{} из {}", total - s.cur.min(total - 1), total)
+            };
+            if ui.add_enabled(total > 0 && s.cur > 0, egui::Button::new("▲")).on_hover_text("Раньше (Enter)").clicked() {
+                up = true;
+            }
+            if ui.add_enabled(total > 0 && s.cur + 1 < total, egui::Button::new("▼")).on_hover_text("Позже (Shift+Enter)").clicked() {
+                down = true;
+            }
+            ui.label(RichText::new(status).color(if has_q && total == 0 { Color32::from_rgb(190, 60, 40) } else { Color32::from_gray(80) }));
+            ui.checkbox(&mut s.only, "только найденные").on_hover_text("Показывать только сообщения, в которых есть искомый текст");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("✖").on_hover_text("Закрыть поиск (Esc)").clicked() {
+                    close = true;
+                }
+            });
+            if up && s.cur > 0 {
+                s.cur -= 1;
+                s.scroll = true;
+            }
+            if down && s.cur + 1 < total {
+                s.cur += 1;
+                s.scroll = true;
+            }
+            if close {
+                s.toggle();
+            }
+        });
+    });
+}
+
 // ------------------------------------------------------------------ chat rendering
 
+#[allow(clippy::too_many_arguments)]
 pub fn chat_lines(
     ui: &mut egui::Ui,
     lines: &[Line],
@@ -140,14 +318,65 @@ pub fn chat_lines(
     font: f32,
     show_delivery: bool,
     show_system: bool,
+    hl: &mut Highlight,
 ) -> bool {
     let time = ui.input(|i| i.time);
     let mut animated = false;
     let max_emo_h = (font * 2.2).max(20.0);
+    let searching = !hl.needle.is_empty();
+    let mut shown = 0usize;
     for l in lines {
         if l.from == 0 && !show_system {
             continue;
         }
+        let is_match = searching && l.from != 0 && contains_ci(&l.text, &hl.needle);
+        if hl.only && searching && !is_match {
+            continue;
+        }
+        shown += 1;
+        let is_cur = is_match && hl.current == Some(l.id);
+        let fill = if is_cur {
+            Some(Color32::from_rgb(255, 222, 130))
+        } else if is_match {
+            Some(Color32::from_rgb(255, 247, 214))
+        } else {
+            None
+        };
+        let rect = match fill {
+            Some(f) => {
+                egui::Frame::none()
+                    .fill(f)
+                    .rounding(3.0)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        animated |= chat_line(ui, l, emo, my_uid, font, show_delivery, &hl.needle, time, max_emo_h);
+                    })
+                    .response
+                    .rect
+            }
+            None => {
+                let mut a = false;
+                let r = ui.scope(|ui| a = chat_line(ui, l, emo, my_uid, font, show_delivery, &[], time, max_emo_h)).response.rect;
+                animated |= a;
+                r
+            }
+        };
+        if is_cur && hl.scroll {
+            ui.scroll_to_rect(rect, Some(egui::Align::Center));
+            hl.scroll = false;
+        }
+    }
+    if searching && hl.only && shown == 0 {
+        ui.label(RichText::new("Ничего не найдено").weak());
+    }
+    animated
+}
+
+/// One chat line; `needle` (non-empty while searching) is highlighted inside the text.
+#[allow(clippy::too_many_arguments)]
+fn chat_line(ui: &mut egui::Ui, l: &Line, emo: Option<&Pack>, my_uid: u64, font: f32, show_delivery: bool, needle: &[char], time: f64, max_emo_h: f32) -> bool {
+    let mut animated = false;
+    {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             let t = chrono::DateTime::from_timestamp(l.time, 0)
@@ -174,11 +403,29 @@ pub fn chat_lines(
             for s in segment(&l.text, emo, 10) {
                 match s {
                     Seg::Text(t) => {
-                        let mut rt = RichText::new(t).size(font);
-                        if l.me {
-                            rt = rt.color(color).italics();
+                        let style = |s: &str| {
+                            let mut rt = RichText::new(s).size(font);
+                            if l.me {
+                                rt = rt.color(color).italics();
+                            }
+                            rt
+                        };
+                        let found = find_ci(t, needle);
+                        if found.is_empty() {
+                            ui.label(style(t));
+                        } else {
+                            let mut pos = 0;
+                            for (a, b) in found {
+                                if a > pos {
+                                    ui.label(style(&t[pos..a]));
+                                }
+                                ui.label(style(&t[a..b]).background_color(Color32::from_rgb(255, 196, 0)).color(Color32::BLACK));
+                                pos = b;
+                            }
+                            if pos < t.len() {
+                                ui.label(style(&t[pos..]));
+                            }
                         }
-                        ui.label(rt);
                     }
                     Seg::Url(u) => {
                         if ui.link(RichText::new(u).size(font)).on_hover_text("Открыть").clicked() {
@@ -406,6 +653,7 @@ impl eframe::App for App {
         }
         self.focused = focused;
         self.minimized = minimized;
+        self.update_alert();
         if let Some(r) = outer {
             if self.visible && !minimized && r.width() > 100.0 {
                 self.main_pos = Some(r.min);
@@ -446,10 +694,10 @@ impl eframe::App for App {
         egui::CentralPanel::default().frame(egui::Frame::central_panel(&ctx.style()).inner_margin(2.0)).show(ctx, |ui| match self.page {
             Page::Users => self.users_page(ui, &mut acts),
             Page::Chat => animated |= self.global_page(ui, &mut acts),
+            Page::Private => animated |= self.private_page(ui, &mut acts),
             Page::Groups => animated |= self.groups_page(ui, &mut acts),
             Page::Events => self.events_page(ui),
         });
-        animated |= self.private_windows(ctx, &mut acts);
         self.info_windows(ctx, &mut acts);
         self.transfers_window(ctx, &mut acts);
         self.setup_window(ctx);
@@ -516,7 +764,7 @@ impl App {
                         self.flash(format!("IP {ip} скопирован"));
                     }
                 }
-                Act::ClearChat(u) => self.clear_chat(u),
+                Act::ClearChat(u) => self.dlg.clear_chat = Some(u),
                 Act::State(s) => {
                     self.set_state(s, false);
                 }
@@ -552,6 +800,21 @@ impl App {
                             self.open_group(g);
                         }
                     }
+                    if p == Page::Private {
+                        if let Some(u) = self.private_sel {
+                            self.open_chat(u);
+                        }
+                    }
+                }
+                Act::CloseDm => self.private_sel = None,
+                Act::JumpPrivate(u, id) => {
+                    self.open_chat(u);
+                    let q = self.dm_filter.trim().to_string();
+                    let c = self.chat_mut(u);
+                    c.search.open = true;
+                    c.search.query = q;
+                    c.search.jump_to = Some(id);
+                    c.input.focus = false;
                 }
                 Act::OpenPath(p) => crate::platform::shell_open(&p),
                 Act::OpenGroup(g) => self.open_group(g),
@@ -590,7 +853,7 @@ impl App {
         let text_focus = ctx.memory(|m| m.focused().is_some());
         // NB: nothing inside `input_mut` may touch the egui context (it is locked) —
         // only record what to do and act afterwards.
-        let (mut refresh, mut setup, mut details, mut hide) = (false, false, false, false);
+        let (mut refresh, mut setup, mut details, mut hide, mut find) = (false, false, false, false, false);
         let states_len = self.cfg.states.len();
         let has_tray = self.tray.is_some();
         ctx.input_mut(|i| {
@@ -611,6 +874,17 @@ impl App {
             }
             if i.consume_key(Modifiers::ALT, Key::F5) {
                 acts.push(Act::Page(Page::Events));
+            }
+            if i.consume_key(Modifiers::ALT, Key::F6) {
+                acts.push(Act::Page(Page::Private));
+            }
+            for (k, p) in [(Key::Num1, Page::Users), (Key::Num2, Page::Chat), (Key::Num3, Page::Private), (Key::Num4, Page::Groups), (Key::Num5, Page::Events)] {
+                if i.consume_key(Modifiers::ALT, k) {
+                    acts.push(Act::Page(p));
+                }
+            }
+            if i.consume_key(Modifiers::CTRL, Key::F) {
+                find = true;
             }
             if i.consume_key(Modifiers::ALT, Key::S) {
                 setup = true;
@@ -642,6 +916,22 @@ impl App {
         if refresh {
             self.refresh_users();
         }
+        if find {
+            match self.page {
+                Page::Users => self.users_filter_focus = true,
+                Page::Chat => self.global_search.start(),
+                Page::Private => match self.private_sel {
+                    Some(u) => self.chat_mut(u).search.start(),
+                    None => self.dm_filter_focus = true,
+                },
+                Page::Groups => {
+                    if let Some(c) = self.group_sel.and_then(|g| self.groups.get_mut(&g)) {
+                        c.search.start();
+                    }
+                }
+                Page::Events => {}
+            }
+        }
         if setup && self.dlg.setup.is_none() {
             self.open_setup();
         }
@@ -658,9 +948,6 @@ impl App {
     fn state_menu(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         let keys = ["Ctrl+R", "Ctrl+W", "Ctrl+D", "Ctrl+P", "Ctrl+A", "Ctrl+O"];
         for (i, s) in self.cfg.states.iter().enumerate() {
-            if i == ST_PRIVATE as usize && self.cfg.privacy.global {
-                continue;
-            }
             let icon = self.icons.get(self.icons.state(i as u8));
             let text = if i < 6 { format!("{}    {}", s.title, keys[i]) } else { format!("{}    Ctrl+{}", s.title, i - 5) };
             let b = egui::Button::image_and_text(img(icon), text).selected(self.cfg.state as usize == i);
@@ -721,10 +1008,10 @@ impl App {
         };
         let online = self.peers.contains_key(&uid);
         if !me {
-            item(ui, "tb_chat", "Личный чат", Act::Chat(uid));
+            item(ui, "tb_chat", "Написать личное сообщение", Act::Chat(uid));
             item(ui, "tb_signal", "Сигнал", Act::Signal(Some(uid)));
             item(ui, "tb_file", "Отправить файл…", Act::File(uid));
-            item(ui, "hd_chat", "Обращение в Global Chat", Act::Appeal(uid));
+            item(ui, "hd_chat", "Обращение в общем чате", Act::Appeal(uid));
             ui.menu_button("👥 Пригласить в беседу", |ui| {
                 if ui.button("➕ Новая беседа…").clicked() {
                     acts.push(Act::NewConv(vec![uid]));
@@ -806,7 +1093,7 @@ impl App {
             });
         }
         if !me {
-            if self.chats.get(&uid).is_some_and(|c| !c.lines.is_empty()) && ui.button("Очистить историю чата").clicked() {
+            if self.chats.get(&uid).is_some_and(|c| !c.lines.is_empty()) && ui.button("Очистить историю личных сообщений").clicked() {
                 acts.push(Act::ClearChat(uid));
                 ui.close_menu();
             }
@@ -846,10 +1133,11 @@ impl App {
                 });
                 ui.menu_button("Вид", |ui| {
                     for (p, n) in [
-                        (Page::Users, "Users    Alt+F1"),
-                        (Page::Chat, "Global Chat    Alt+F2"),
-                        (Page::Groups, "Group Chat    Alt+F3"),
-                        (Page::Events, "Event Log    Alt+F5"),
+                        (Page::Users, "Пользователи    Alt+F1"),
+                        (Page::Chat, "Общий чат    Alt+F2"),
+                        (Page::Private, "Личные сообщения    Alt+F6"),
+                        (Page::Groups, "Групповой чат    Alt+F3"),
+                        (Page::Events, "Журнал событий    Alt+F5"),
                     ] {
                         if ui.selectable_label(self.page == p, n).clicked() {
                             acts.push(Act::Page(p));
@@ -941,7 +1229,7 @@ impl App {
                     }
                 };
                 let s = sel.unwrap_or(0);
-                tb(ui, "tb_chat", "Личный чат", sel.is_some(), Act::Chat(s));
+                tb(ui, "tb_chat", "Написать личное сообщение", sel.is_some(), Act::Chat(s));
                 tb(ui, "tb_signal", "Сигнал (F4 — всем)", sel.is_some(), Act::Signal(Some(s)));
                 tb(ui, "tb_file", "Отправить файл", sel.is_some(), Act::File(s));
                 tb(ui, "tb_info", "Информация о пользователе", self.selected.is_some(), Act::Info(self.selected.unwrap_or(0), InfoTab::Details));
@@ -988,7 +1276,7 @@ impl App {
                         let txt = format!("● {}:{}", if ok { n.bound_ip.to_string() } else { "0.0.0.0".into() }, n.port);
                         ui.label(RichText::new(txt).color(if ok { Color32::from_rgb(40, 150, 40) } else { Color32::from_rgb(200, 120, 0) }))
                             .on_hover_text(format!(
-                                "Интерфейс закреплён в настройках: {}\nBroadcast 255.255.255.255:{}\nTCP порт: {}",
+                                "Интерфейс закреплён в настройках: {}\nШироковещательная рассылка: 255.255.255.255:{}\nTCP-порт: {}",
                                 self.cfg.conn.bind_ip, n.port, n.tcp_port
                             ));
                     }
@@ -1044,20 +1332,23 @@ impl App {
             .exact_width(92.0)
             .frame(egui::Frame::none().fill(VIEWBAR_BG).inner_margin(egui::Margin::symmetric(4.0, 8.0)))
             .show(ctx, |ui| {
+                egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     let blink = (ui.input(|i| i.time) * 2.0) as i64 % 2 == 0;
                     let unread_chat = self.global_unread && self.page != Page::Chat;
                     let unread_ev = self.events_unread && self.page != Page::Events;
-                    let unread_groups = self.page != Page::Groups && self.groups.values().any(|c| c.unread > 0);
+                    let unread_groups = self.groups.values().any(|c| c.unread > 0);
+                    let unread_private: u32 = self.chats.values().map(|c| c.unread).sum();
                     let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                    for (page, icon, label, flag) in [
-                        (Page::Users, "vb_users", "Users", false),
-                        (Page::Chat, "vb_chat", "Global Chat", unread_chat),
-                        (Page::Groups, "vb_chat", "Group Chat", unread_groups),
-                        (Page::Events, "vb_eventlog", "Event Log", unread_ev),
+                    for (page, icon, label, flag, count) in [
+                        (Page::Users, "vb_users", "Пользователи", false, 0u32),
+                        (Page::Chat, "vb_chat", "Общий чат", unread_chat, 0),
+                        (Page::Private, "tb_message", "Личные\nсообщения", unread_private > 0, unread_private),
+                        (Page::Groups, "vb_chat", "Групповой\nчат", unread_groups, self.groups.values().map(|c| c.unread).sum()),
+                        (Page::Events, "vb_eventlog", "Журнал\nсобытий", unread_ev, 0),
                     ] {
                         let sel = self.page == page;
-                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(84.0, 76.0), Sense::click());
+                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(84.0, 80.0), Sense::click());
                         let pressed = resp.is_pointer_button_down_on();
                         let r2 = rect.shrink(2.0);
                         if pressed {
@@ -1072,23 +1363,43 @@ impl App {
                         }
                         let off = if pressed { egui::vec2(1.0, 1.0) } else { egui::Vec2::ZERO };
                         let tint = if flag && blink { Color32::from_rgb(255, 230, 120) } else { Color32::WHITE };
+                        let icon_c = rect.center_top() + egui::vec2(0.0, 25.0) + off;
                         if page == Page::Groups {
                             // two overlapping bubbles + people badge
                             if let Some(t) = self.icons.get("vb_chat") {
-                                let c = rect.center_top() + egui::vec2(0.0, 28.0) + off;
-                                ui.painter().image(t.id, egui::Rect::from_center_size(c + egui::vec2(-6.0, -4.0), egui::vec2(38.0, 38.0)), uv, tint);
-                                ui.painter().image(t.id, egui::Rect::from_center_size(c + egui::vec2(7.0, 5.0), egui::vec2(38.0, 38.0)), uv, tint);
+                                ui.painter().image(t.id, egui::Rect::from_center_size(icon_c + egui::vec2(-6.0, -4.0), egui::vec2(32.0, 32.0)), uv, tint);
+                                ui.painter().image(t.id, egui::Rect::from_center_size(icon_c + egui::vec2(7.0, 5.0), egui::vec2(32.0, 32.0)), uv, tint);
                             }
                             if let Some(t) = self.icons.get("hd_users") {
-                                let c = rect.center_top() + egui::vec2(16.0, 42.0) + off;
-                                ui.painter().image(t.id, egui::Rect::from_center_size(c, egui::vec2(20.0, 20.0)), uv, Color32::WHITE);
+                                ui.painter().image(t.id, egui::Rect::from_center_size(icon_c + egui::vec2(16.0, 12.0), egui::vec2(18.0, 18.0)), uv, Color32::WHITE);
+                            }
+                        } else if page == Page::Private {
+                            // a speech bubble with an envelope
+                            if let Some(t) = self.icons.get("vb_chat") {
+                                ui.painter().image(t.id, egui::Rect::from_center_size(icon_c, egui::vec2(40.0, 40.0)), uv, tint);
+                            }
+                            if let Some(t) = self.icons.get(icon) {
+                                ui.painter().image(t.id, egui::Rect::from_center_size(icon_c + egui::vec2(14.0, 11.0), egui::vec2(20.0, 20.0)), uv, Color32::WHITE);
                             }
                         } else if let Some(t) = self.icons.get(icon) {
-                            let r = egui::Rect::from_center_size(rect.center_top() + egui::vec2(0.0, 28.0) + off, egui::vec2(48.0, 48.0));
-                            ui.painter().image(t.id, r, uv, tint);
+                            ui.painter().image(t.id, egui::Rect::from_center_size(icon_c, egui::vec2(40.0, 40.0)), uv, tint);
+                        }
+                        if count > 0 {
+                            // unread counter badge
+                            let txt = if count > 99 { "99+".to_string() } else { count.to_string() };
+                            let g = ui.painter().layout_no_wrap(txt, egui::FontId::proportional(11.0), Color32::WHITE);
+                            let w = (g.size().x + 8.0).max(18.0);
+                            let br = egui::Rect::from_center_size(rect.right_top() + egui::vec2(-w / 2.0 - 4.0, 12.0) + off, egui::vec2(w, 18.0));
+                            ui.painter().rect_filled(br, 9.0f32, Color32::from_rgb(225, 50, 50));
+                            ui.painter().galley(br.center() - g.size() / 2.0, g, Color32::WHITE);
                         }
                         let col = if flag && blink { Color32::YELLOW } else { Color32::WHITE };
-                        ui.painter().text(rect.center_bottom() - egui::vec2(0.0, 9.0) + off, egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(12.0), col);
+                        let lines: Vec<&str> = label.split('\n').collect();
+                        let y0 = if lines.len() == 1 { rect.top() + 57.0 } else { rect.top() + 50.0 };
+                        for (k, s) in lines.iter().enumerate() {
+                            let p = egui::pos2(rect.center().x, y0 + k as f32 * 14.0) + off;
+                            ui.painter().text(p, egui::Align2::CENTER_TOP, *s, egui::FontId::proportional(11.5), col);
+                        }
                         if resp.clicked() {
                             acts.push(Act::Page(page));
                         }
@@ -1096,6 +1407,7 @@ impl App {
                             ui.ctx().request_repaint_after(Duration::from_millis(500));
                         }
                     }
+                });
                 });
             });
     }
@@ -1129,7 +1441,45 @@ impl App {
         });
         let mut out = vec![self.cfg.uid];
         out.extend(v.iter().map(|p| p.uid));
+        let needle = lower_chars(&self.users_filter);
+        if !needle.is_empty() {
+            out.retain(|u| self.user_matches(*u, &needle));
+        }
         out
+    }
+
+    /// Users search: nick, computer, IP, Windows user, state, active window, name / department.
+    fn user_matches(&self, uid: u64, needle: &[char]) -> bool {
+        let mut fields: Vec<String> = Vec::new();
+        if uid == self.cfg.uid {
+            let p = self.presence();
+            fields.extend([p.nick, p.computer, p.os_user, p.state_title, p.state_text, p.fg_title.unwrap_or_default()]);
+            fields.push(self.net.as_ref().map(|n| n.local_ip.to_string()).unwrap_or_default());
+            fields.extend([self.cfg.details.full_name.clone(), self.cfg.details.department.clone()]);
+        } else if let Some(p) = self.peers.get(&uid) {
+            let q = &p.p;
+            fields.extend([q.nick.clone(), q.computer.clone(), q.os_user.clone(), q.state_title.clone(), q.state_text.clone()]);
+            fields.push(q.fg_title.clone().unwrap_or_default());
+            fields.push(p.ip.to_string());
+            if let Some(d) = &p.details {
+                fields.extend([d.full_name.clone(), d.department.clone(), d.position.clone()]);
+            }
+        }
+        fields.iter().any(|f| contains_ci(f, needle))
+    }
+
+    /// Search box for the users list (shared by the Users page and the side panel).
+    fn users_search_box(&mut self, ui: &mut egui::Ui, width: f32) {
+        let id = egui::Id::new("users_search");
+        if ui.memory(|m| m.has_focus(id)) && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            self.users_filter.clear();
+        }
+        let r = ui.add(egui::TextEdit::singleline(&mut self.users_filter).id(id).hint_text("🔍 Поиск пользователей").desired_width(width));
+        if self.users_filter_focus {
+            r.request_focus();
+            self.users_filter_focus = false;
+        }
+        r.on_hover_text("Ник, компьютер, IP-адрес, имя, отдел, состояние… (Ctrl+F, Esc — очистить)");
     }
 
     /// Groups -> uids (first entry: users without a group, title "").
@@ -1197,10 +1547,18 @@ impl App {
             Col::Ping => {
                 ui.label(if me { "0".into() } else { peer.and_then(|x| x.ping_ms).map(|m| m.to_string()).unwrap_or("—".into()) });
             }
-            Col::FgTitle => {
-                let t = p.fg_title.clone().unwrap_or_else(|| "🔒".into());
-                ui.add(egui::Label::new(t).truncate().selectable(false));
-            }
+            Col::FgTitle => match p.fg_title.as_deref() {
+                Some(t) if !t.trim().is_empty() => {
+                    ui.add(egui::Label::new(t).truncate().selectable(false));
+                }
+                Some(_) => {
+                    ui.label(RichText::new("—").color(Color32::GRAY));
+                }
+                None => {
+                    ui.add(egui::Label::new(RichText::new("—").color(Color32::GRAY)).selectable(false))
+                        .on_hover_text("Скрыто: у пользователя включена приватность");
+                }
+            },
             Col::Ip => {
                 ui.label(if me { self.net.as_ref().map(|n| n.local_ip.to_string()).unwrap_or_default() } else { peer.map(|x| x.ip.to_string()).unwrap_or_default() });
             }
@@ -1245,9 +1603,19 @@ impl App {
     }
 
     fn users_page(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        header_bar(ui, self.icons.get("hd_users"), "Users", &format!("{} польз.", self.peers.len() + 1));
-        let cols: Vec<Col> = self.cfg.columns.iter().filter(|c| c.1).map(|c| c.0).collect();
         let groups = self.grouped();
+        let found: usize = groups.iter().map(|g| g.1.len()).sum();
+        let filtering = !self.users_filter.trim().is_empty();
+        let right = if filtering { format!("найдено: {found} из {}", self.peers.len() + 1) } else { format!("в сети: {}", self.peers.len() + 1) };
+        let icon = self.icons.get("hd_users");
+        header_bar_ex(ui, icon, "Пользователи", &right, |ui| {
+            if filtering && ui.small_button("✖").on_hover_text("Сбросить поиск").clicked() {
+                self.users_filter.clear();
+            }
+            let w = (ui.available_width() * 0.45).clamp(140.0, 280.0);
+            self.users_search_box(ui, w);
+        });
+        let cols: Vec<Col> = self.cfg.columns.iter().filter(|c| c.1).map(|c| c.0).collect();
         let mut toggle_group: Option<String> = None;
         let collapsed: std::collections::HashSet<String> =
             ui.data(|d| d.get_temp::<std::collections::HashSet<String>>(egui::Id::new("collapsed_groups")).unwrap_or_default());
@@ -1281,7 +1649,7 @@ impl App {
                         continue;
                     }
                     if !g.is_empty() {
-                        let is_collapsed = collapsed.contains(g);
+                        let is_collapsed = collapsed.contains(g) && !filtering;
                         body.row(20.0, |mut row| {
                             for (i, _) in cols.iter().enumerate() {
                                 row.col(|ui| {
@@ -1339,6 +1707,7 @@ impl App {
     }
 
     fn users_compact(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        self.users_search_box(ui, ui.available_width());
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for (g, uids) in self.grouped() {
                 if !g.is_empty() {
@@ -1364,7 +1733,7 @@ impl App {
                         nick
                     };
                     let r = tool_button(ui, self.icons.sized(self.icons.state(st), 16.0), Some(&text), 16.0, true, self.selected == Some(uid))
-                        .on_hover_text(format!("{tip}\nДвойной щелчок — личный чат, правая кнопка — меню"));
+                        .on_hover_text(format!("{tip}\nДвойной щелчок — личное сообщение, правая кнопка — меню"));
                     self.handle_row(&r, uid, acts);
                 }
             }
@@ -1375,7 +1744,20 @@ impl App {
 
     fn global_page(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) -> bool {
         self.global_unread = false;
-        header_bar(ui, self.icons.get("hd_chat"), "Global Chat", "сообщения для всех");
+        let icon = self.icons.get("hd_chat");
+        let search_open = self.global_search.open;
+        let mut toggle = false;
+        header_bar_ex(ui, icon, "Общий чат", "сообщения для всех", |ui| {
+            toggle = search_icon_button(ui, search_open, Color32::WHITE).clicked();
+        });
+        if toggle {
+            self.global_search.toggle();
+        }
+        let (needle, matches) = search_matches(&self.global, &self.global_search);
+        sync_search(&mut self.global_search, &self.global, &matches);
+        if self.global_search.open {
+            search_bar(ui, &mut self.global_search, "global_search", matches.len());
+        }
         let nicks: Vec<String> = self.peers.values().map(|p| p.p.nick.clone()).collect();
         let font = self.cfg.chat.font_size;
         egui::TopBottomPanel::bottom("global_input").show_inside(ui, |ui| {
@@ -1392,11 +1774,11 @@ impl App {
                     self.flash(if auto { "Автопрокрутка выключена" } else { "Автопрокрутка включена" });
                 }
                 if tool_button(ui, self.icons.sized("tb_leave", 20.0), Some("Очистить окно"), 20.0, !self.global.is_empty(), false)
-                    .on_hover_text("Очистить окно Global Chat (история на диске сохраняется)")
+                    .on_hover_text("Очистить окно общего чата (история на диске сохраняется)")
                     .clicked()
                 {
                     self.global.clear();
-                    self.flash("Окно Global Chat очищено");
+                    self.flash("Окно общего чата очищено");
                 }
                 ui.label(RichText::new("/help — команды").weak().small());
             });
@@ -1408,17 +1790,25 @@ impl App {
             }
         });
         let mut animated = false;
+        let searching = !needle.is_empty();
+        let mut hl = Highlight {
+            current: matches.get(self.global_search.cur).map(|i| self.global[*i].id),
+            needle,
+            scroll: self.global_search.scroll,
+            only: self.global_search.only,
+        };
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(Color32::WHITE).inner_margin(6.0))
             .show_inside(ui, |ui| {
-                egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(self.cfg.chat.autoscroll).show(ui, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(self.cfg.chat.autoscroll && !searching).show(ui, |ui| {
                     let emo = if self.cfg.chat.no_emoticons { None } else { self.emo.as_ref() };
-                    animated = chat_lines(ui, &self.global, emo, self.cfg.uid, font, false, self.cfg.chat.show_system);
+                    animated = chat_lines(ui, &self.global, emo, self.cfg.uid, font, false, self.cfg.chat.show_system, &mut hl);
                     if self.global.is_empty() {
-                        ui.label(RichText::new("Здесь появляются сообщения для всех. Личный чат — правой кнопкой по пользователю → «Чат».").weak());
+                        ui.label(RichText::new("Здесь появляются сообщения для всех. Личное сообщение — правой кнопкой по пользователю → «Написать личное сообщение».").weak());
                     }
                 });
             });
+        self.global_search.scroll = hl.scroll;
         animated
     }
 
@@ -1426,7 +1816,7 @@ impl App {
 
     fn events_page(&mut self, ui: &mut egui::Ui) {
         self.events_unread = false;
-        header_bar(ui, self.icons.get("hd_eventlog"), "Event Log", &format!("{} записей", self.events.len()));
+        header_bar(ui, self.icons.get("hd_eventlog"), "Журнал событий", &format!("{} записей", self.events.len()));
         let info = self.icons.sized("ev_info", 16.0);
         TableBuilder::new(ui)
             .striped(true)
@@ -1485,100 +1875,6 @@ impl App {
                     });
                 });
             });
-    }
-
-    // ------------------------------------------------------------------ private chats
-
-    fn private_windows(&mut self, ctx: &egui::Context, acts: &mut Vec<Act>) -> bool {
-        let mut animated = false;
-        let uids: Vec<u64> = self.chats.values().filter(|c| c.open).map(|c| c.uid).collect();
-        let font = self.cfg.chat.font_size;
-        let nicks: Vec<String> = self.peers.values().map(|p| p.p.nick.clone()).collect();
-        for uid in uids {
-            let nick = self.peer_name(uid);
-            let online = self.peers.get(&uid);
-            let (st, sub) = match online {
-                Some(p) => (
-                    p.p.state,
-                    format!(
-                        "{} · {} · {}{}",
-                        p.p.computer,
-                        p.ip,
-                        p.p.state_title,
-                        if p.p.state_text.is_empty() { String::new() } else { format!(" — {}", p.p.state_text) }
-                    ),
-                ),
-                None => (ST_OFFLINE, "не в сети — сообщения будут доставлены, когда появится".into()),
-            };
-            let typing = online.is_some_and(|p| p.typing_until.is_some_and(|t| t > std::time::Instant::now()));
-            let is_online = online.is_some();
-            let st_icon = self.icons.sized(self.icons.state(st), 16.0);
-            let emo_icon = self.icons.sized("tb_emoticon", 22.0);
-            let mut open = true;
-            let chat = self.chats.get_mut(&uid).unwrap();
-            let unread = chat.unread;
-            let title = if unread > 0 { format!("Чат: {nick}  ✉{unread}") } else { format!("Чат: {nick}") };
-            let emo = if self.cfg.chat.no_emoticons { None } else { self.emo.as_ref() };
-            let my_uid = self.cfg.uid;
-            let macros = &mut self.cfg.chat.macros;
-            let icons = &self.icons;
-            let resp = egui::Window::new(title)
-                .id(egui::Id::new(("pchat", uid)))
-                .open(&mut open)
-                .default_size([420.0, 360.0])
-                .min_width(300.0)
-                .max_width(900.0)
-                .min_height(220.0)
-                .resizable(true)
-                .collapsible(true)
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.add(img(st_icon));
-                        ui.label(RichText::new(&nick).strong().size(15.0));
-                        ui.add(egui::Label::new(RichText::new(&sub).weak().small()).truncate()).on_hover_text(&sub);
-                    });
-                    ui.horizontal(|ui| {
-                        let mut tb = |ui: &mut egui::Ui, icon: &str, tip: &str, en: bool, a: Act| {
-                            if tool_button(ui, icons.sized(icon, 20.0), None, 20.0, en, false).on_hover_text(tip).clicked() {
-                                acts.push(a);
-                            }
-                        };
-                        tb(ui, "tb_signal", "Сигнал", is_online, Act::Signal(Some(uid)));
-                        tb(ui, "tb_file", "Отправить файл", is_online, Act::File(uid));
-                        tb(ui, "tb_info", "Информация", is_online, Act::Info(uid, InfoTab::Details));
-                        tb(ui, "tb_delete", "Очистить историю (недоставленные останутся)", true, Act::ClearChat(uid));
-                        if typing {
-                            ui.label(RichText::new("✎ печатает…").italics().color(Color32::GRAY));
-                        }
-                    });
-                    egui::TopBottomPanel::bottom(egui::Id::new(("pchat_in", uid))).show_inside(ui, |ui| {
-                        ui.add_space(3.0);
-                        let out = chat_input(ui, &mut chat.input, ("pchat_box", uid), emo, emo_icon, macros, &nicks, font);
-                        if let Some(t) = out.submit {
-                            acts.push(Act::SendPrivate(uid, t));
-                        } else if out.typed && !chat.input.text.is_empty() && is_online {
-                            acts.push(Act::Typing(uid));
-                        }
-                    });
-                    egui::CentralPanel::default().frame(egui::Frame::none().fill(Color32::WHITE).inner_margin(4.0)).show_inside(ui, |ui| {
-                        egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
-                            if chat.lines.is_empty() {
-                                ui.label(RichText::new("История пуста. Переписка сохраняется на диске.").weak());
-                            }
-                            animated |= chat_lines(ui, &chat.lines, emo, my_uid, font, true, true);
-                        });
-                    });
-                });
-            if let Some(r) = resp {
-                if r.response.contains_pointer() || ctx.memory(|m| m.has_focus(egui::Id::new(("pchat_box", uid)))) || self.focused {
-                    chat.unread = 0;
-                }
-            }
-            if !open {
-                chat.open = false;
-            }
-        }
-        animated
     }
 
     // ------------------------------------------------------------------ info windows
@@ -1667,7 +1963,7 @@ impl App {
                                         ("Должность", d.position.clone()),
                                         ("Рабочий тел.", d.phone_work.clone()),
                                         ("Мобильный", d.phone_mobile.clone()),
-                                        ("E-mail", d.email.clone()),
+                                        ("Эл. почта", d.email.clone()),
                                         ("Адрес", d.address.clone()),
                                         ("Заметки", d.notes.clone()),
                                     ];
@@ -1742,7 +2038,7 @@ impl App {
                                             ui.selectable_value(&mut w.monitor, m, format!("Монитор {m}"));
                                         }
                                     });
-                                ui.add(egui::Slider::new(&mut w.quality, 20..=95).text("JPEG"));
+                                ui.add(egui::Slider::new(&mut w.quality, 20..=95).text("качество"));
                                 ui.checkbox(&mut w.fit, "Вписать");
                                 if ui.add_enabled(!w.shot_jpeg.is_empty(), egui::Button::new("💾 Сохранить")).clicked() {
                                     if let Some(p) = rfd::FileDialog::new().add_filter("JPEG", &["jpg"]).set_file_name(format!("screenshot_{nick}.jpg")).save_file() {
@@ -1888,7 +2184,7 @@ impl App {
                 let r = ui.text_edit_singleline(name);
                 r.request_focus();
                 ui.horizontal(|ui| {
-                    if ui.button("OK").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                    if ui.button("ОК").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
                         done = Some(true);
                     }
                     if ui.button("Отмена").clicked() {
@@ -1912,7 +2208,7 @@ impl App {
             egui::Window::new("Новый ник").collapsible(false).resizable(false).show(ctx, |ui| {
                 ui.text_edit_singleline(name).request_focus();
                 ui.horizontal(|ui| {
-                    if ui.button("OK").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                    if ui.button("ОК").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
                         done = Some(true);
                     }
                     if ui.button("Отмена").clicked() {
@@ -2047,7 +2343,7 @@ impl App {
                         row(ui, "Должность", &mut d.position);
                         row(ui, "Рабочий тел.", &mut d.phone_work);
                         row(ui, "Мобильный", &mut d.phone_mobile);
-                        row(ui, "E-mail", &mut d.email);
+                        row(ui, "Эл. почта", &mut d.email);
                         row(ui, "Адрес", &mut d.address);
                         ui.label("Заметки");
                         ui.text_edit_multiline(&mut d.notes);
@@ -2074,6 +2370,29 @@ impl App {
                 }
             }
         }
+        if let Some(u) = self.dlg.clear_chat {
+            let nick = self.peer_name(u);
+            let mut done = None;
+            egui::Window::new("Очистить историю").collapsible(false).resizable(false).show(ctx, |ui| {
+                ui.label(format!("Удалить всю переписку с {nick}?"));
+                ui.label(RichText::new("Это действие нельзя отменить. Недоставленные сообщения останутся.").small().weak());
+                ui.horizontal(|ui| {
+                    if ui.button("🗑 Удалить").clicked() {
+                        done = Some(true);
+                    }
+                    if ui.button("Отмена").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                        done = Some(false);
+                    }
+                });
+            });
+            if let Some(ok) = done {
+                self.dlg.clear_chat = None;
+                if ok {
+                    self.clear_chat(u);
+                    self.flash(format!("История переписки с {nick} очищена"));
+                }
+            }
+        }
         if self.dlg.about {
             egui::Window::new("О программе").collapsible(false).resizable(false).open(&mut self.dlg.about).show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -2087,12 +2406,14 @@ impl App {
         }
         if self.dlg.help {
             egui::Window::new("Клавиши и команды").open(&mut self.dlg.help).default_width(480.0).show(ctx, |ui| {
-                ui.label(RichText::new("Global Chat").strong());
+                ui.label(RichText::new("Общий чат").strong());
                 ui.label("/me текст — действие от своего имени\n/nick ник — сменить ник\n/here — кто в сети\n/m ник текст — личное сообщение\n/s [ник] — сигнал\n/i ник — информация о пользователе\n/clear — очистить окно");
                 ui.label(RichText::new("Ввод текста").strong());
                 ui.label("Enter — отправить, Ctrl+Enter — новая строка\nCtrl+↑/↓ — история фраз, Tab — дописать ник\nAlt+R — исправить раскладку (EN↔RU)\nShift+F1..F12 — макрос, Shift+Ctrl+F1..F12 — запомнить макрос");
+                ui.label(RichText::new("Поиск").strong());
+                ui.label("Ctrl+F — поиск на текущей вкладке (пользователи, общий чат, личные сообщения, беседа)\nEnter / ▲ — более раннее совпадение, Shift+Enter / ▼ — более позднее, Esc — закрыть");
                 ui.label(RichText::new("Окно").strong());
-                ui.label("Ctrl+R/W/D/P/A/O — состояние, Ctrl+1..6 — свои состояния\nF5 — обновить список, F4 — сигнал всем\nAlt+F1/F2/F3 — Users / Global Chat / Event Log\nAlt+S — настройка, Alt+M — мои данные, Alt+D — выход, Esc — в трей");
+                ui.label("Ctrl+R/W/D/P/A/O — состояние, Ctrl+1..6 — свои состояния\nF5 — обновить список, F4 — сигнал всем\nAlt+1…5 — вкладки по порядку\nAlt+F1 — Пользователи, Alt+F2 — Общий чат, Alt+F6 — Личные сообщения,\nAlt+F3 — Групповой чат, Alt+F5 — Журнал событий\nAlt+S — настройка, Alt+M — мои данные, Alt+D — выход, Esc — в трей");
             });
         }
     }
@@ -2117,7 +2438,7 @@ impl App {
             egui::TopBottomPanel::bottom("setup_buttons").show_inside(ui, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if ui.button("OK").clicked() {
+                    if ui.button("ОК").clicked() {
                         result = Some(1);
                     }
                     if ui.button("Отмена").clicked() {
@@ -2141,9 +2462,17 @@ impl App {
                         0 => {
                             ui.checkbox(&mut d.general.close_to_tray, "Кнопка «Закрыть» сворачивает в трей");
                             ui.checkbox(&mut d.general.start_minimized, "Запускаться свёрнутым в трей");
-                            ui.checkbox(&mut d.general.popup_on_private, "Разворачивать окно при личном сообщении");
-                            ui.checkbox(&mut d.general.popup_on_global, "Разворачивать окно при сообщении в Global Chat");
-                            ui.checkbox(&mut d.general.tip_enabled, "Всплывающие уведомления (Chat-In-Tip)");
+                            ui.checkbox(&mut d.general.popup_on_private, "Разворачивать окно и открывать «Личные сообщения» при новом личном сообщении");
+                            ui.checkbox(&mut d.general.popup_on_global, "Разворачивать окно при сообщении в общем чате");
+                            ui.checkbox(&mut d.general.flash_on_message, "Мигать значком программы, если пришло сообщение, а меня нет на месте")
+                                .on_hover_text("Общий чат, личные сообщения, беседы, сигналы и файлы.\nМигает кнопка в панели задач (а если программа свёрнута в трей — значок в трее),\nпока вы не вернётесь к окну программы.");
+                            ui.add_enabled_ui(d.general.flash_on_message, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("    Считать, что меня нет на месте, если окно не активно или нет действий с мышью/клавиатурой, сек:");
+                                    ui.add(egui::DragValue::new(&mut d.general.away_secs).range(5..=3600));
+                                });
+                            });
+                            ui.checkbox(&mut d.general.tip_enabled, "Всплывающие уведомления о сообщениях");
                             ui.horizontal(|ui| {
                                 ui.label("Показывать, сек:");
                                 ui.add(egui::DragValue::new(&mut d.general.tip_secs).range(1..=60));
@@ -2174,7 +2503,7 @@ impl App {
                             }
                         }
                         1 => {
-                            ui.label("Все сообщения для всех отправляются broadcast'ом на 255.255.255.255. Один порт — для UDP и TCP.");
+                            ui.label("Сообщения для всех рассылаются широковещательно на 255.255.255.255. Один порт — для UDP и TCP.");
                             ui.add_space(6.0);
                             ui.label(RichText::new("Сетевой интерфейс (закрепляется жёстко)").strong());
                             let cur = d.conn.bind_ip.clone();
@@ -2211,18 +2540,47 @@ impl App {
                             ui.label(RichText::new("Пароль шифрует трафик; общаться могут только копии с одинаковым паролем (пусто — общий ключ).").small().weak());
                         }
                         2 => {
-                            ui.label(RichText::new("Режим приватности").strong());
-                            ui.radio_value(&mut d.privacy.global, true, "Во всех состояниях (рекомендуется)");
+                            ui.label(RichText::new("Когда действуют ограничения").strong());
+                            ui.radio_value(&mut d.privacy.global, true, "Всегда, во всех состояниях (рекомендуется)");
                             ui.radio_value(&mut d.privacy.global, false, "Только в состоянии «Приватный»");
                             ui.add_space(4.0);
-                            ui.label("В режиме приватности запретить другим:");
-                            ui.checkbox(&mut d.privacy.no_fg_title, "Видеть заголовок моего активного окна");
+                            ui.label("Запретить другим:");
+                            ui.checkbox(&mut d.privacy.no_fg_title, "Видеть заголовок моего активного окна (вместо него — «—»)");
                             ui.checkbox(&mut d.privacy.no_processes, "Просматривать мои процессы");
                             ui.checkbox(&mut d.privacy.no_screenshot, "Снимать мой экран");
                             ui.checkbox(&mut d.privacy.no_clipboard, "Читать мой буфер обмена");
                             ui.separator();
                             ui.checkbox(&mut d.privacy.no_remote_kill, "Запретить удалённое завершение моих процессов (всегда)");
-                            ui.label(RichText::new("Каждый удалённый запрос записывается в Event Log.").small().weak());
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new(
+                                    "В состоянии «Приватный» (Ctrl+P) скрывается всё: активное окно (у других в списке — «—»), \
+                                     процессы, экран и буфер обмена — независимо от галочек выше.",
+                                )
+                                .small(),
+                            );
+                            ui.add_space(6.0);
+                            // what the others see right now with these settings
+                            let mut preview = d.clone();
+                            preview.state = self.cfg.state;
+                            let a = preview.effective_allow();
+                            let yes_no = |b: bool| if b { "видно" } else { "скрыто" };
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.label(RichText::new(format!("Сейчас (состояние «{}») другие видят:", self.cfg.cur_state().title)).strong());
+                                egui::Grid::new("privacy_now").num_columns(2).show(ui, |ui| {
+                                    for (k, v) in [
+                                        ("Активное окно", a.fg_title),
+                                        ("Процессы", a.processes),
+                                        ("Снимок экрана", a.screenshot),
+                                        ("Буфер обмена", a.clipboard),
+                                    ] {
+                                        ui.label(k);
+                                        ui.label(RichText::new(yes_no(v)).color(if v { Color32::from_rgb(40, 130, 40) } else { Color32::from_rgb(190, 60, 40) }));
+                                        ui.end_row();
+                                    }
+                                });
+                            });
+                            ui.label(RichText::new("Каждый удалённый запрос записывается в журнал событий.").small().weak());
                         }
                         3 => {
                             ui.label(RichText::new("Удалённый доступ к этому компьютеру").strong());
@@ -2234,7 +2592,7 @@ impl App {
                             ui.add_space(6.0);
                             ui.label(
                                 RichText::new(
-                                    "Во время сеанса на экране всегда виден индикатор с кнопкой «Отключить», всё пишется в Event Log. \
+                                    "Во время сеанса на экране всегда виден индикатор с кнопкой «Отключить», всё пишется в журнал событий. \
                                      Пароль не передаётся по сети (проверка challenge-response), неверный пароль — задержка 2 с.",
                                 )
                                 .small()
@@ -2259,7 +2617,7 @@ impl App {
                                 ui.add(egui::Slider::new(&mut d.chat.font_size, 10.0..=24.0));
                             });
                             ui.horizontal(|ui| {
-                                ui.label("Хранить строк Global Chat в окне:");
+                                ui.label("Хранить строк общего чата в окне:");
                                 ui.add(egui::DragValue::new(&mut d.chat.history_lines).range(100..=20000));
                             });
                             ui.separator();
@@ -2417,8 +2775,8 @@ impl App {
             2 => egui::pos2(ax + 8.0, ay + ah - h - 8.0),
             _ => egui::pos2(ax + aw - w - 8.0, ay + ah - h - 8.0),
         };
-        let tips: Vec<(String, String, Option<u64>)> = self.tips.iter().map(|t| (t.title.clone(), t.text.clone(), t.chat_uid)).collect();
-        let mut clicked: Option<Option<u64>> = None;
+        let tips: Vec<(String, String, (Option<u64>, Option<u64>))> = self.tips.iter().map(|t| (t.title.clone(), t.text.clone(), (t.chat_uid, t.group))).collect();
+        let mut clicked: Option<(Option<u64>, Option<u64>)> = None;
         let mut dismiss = false;
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("chat_in_tip"),
@@ -2466,8 +2824,9 @@ impl App {
             self.tips.clear();
             self.show_main();
             match uid {
-                Some(u) => self.open_chat(u),
-                None => self.page = Page::Chat,
+                (Some(u), _) => self.open_chat(u),
+                (None, Some(g)) => self.open_group(g),
+                _ => self.page = Page::Chat,
             }
         }
         ctx.request_repaint_after(Duration::from_millis(250));
@@ -2476,7 +2835,19 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::word_start;
+    use super::{contains_ci, find_ci, lower_chars, word_start};
+
+    #[test]
+    fn search_is_case_insensitive_and_yo_agnostic() {
+        let n = lower_chars("ЁЛКА");
+        assert!(contains_ci("новая елка во дворе", &n));
+        assert!(contains_ci("Ёлка", &n));
+        assert!(!contains_ci("ель", &n));
+        let n = lower_chars("  при ");
+        assert_eq!(find_ci("Привет, ПРИятель", &n), vec![(0, 6), (14, 20)]);
+        assert!(find_ci("abc", &[]).is_empty());
+        assert!(contains_ci("abc", &[]));
+    }
 
     #[test]
     fn word_start_handles_multibyte_whitespace() {

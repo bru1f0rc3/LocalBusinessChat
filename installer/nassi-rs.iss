@@ -1,11 +1,16 @@
 ﻿; Nassi RS installer (Inno Setup 6.3+)
-; One setup.exe for both architectures: the installer itself is 32-bit, runs on
-; x86 and x64 Windows and installs the matching build of the program.
+; One setup.exe for all supported systems: the installer itself is 32-bit, runs on
+; Windows 7 SP1 ... 11 (x86 and x64) and installs the matching build of the program:
+;   64-bit Windows 10/11        -> x86_64-pc-windows-msvc
+;   64-bit Windows 7 SP1 / 8.x  -> x86_64-win7-windows-msvc
+;   32-bit Windows 7 SP1 ... 11 -> i686-win7-windows-msvc
 ;
 ; Build: build-installer.ps1 (compiles both targets, then runs ISCC on this file)
 
 #define AppName "Nassi RS"
-#define AppVersion "0.1.0"
+#ifndef AppVersion
+  #define AppVersion "0.2.0"
+#endif
 #define AppExe "NassiRS.exe"
 #define Root ".."
 #define Assets ".."
@@ -35,7 +40,8 @@ SolidCompression=yes
 WizardStyle=modern
 CloseApplications=force
 RestartApplications=no
-MinVersion=10.0
+; Windows 7 SP1 and later (it was 10.0, so Windows 7/8.1 refused to install)
+MinVersion=6.1sp1
 
 [Languages]
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
@@ -47,10 +53,12 @@ Name: "autostart"; Description: "Запускать Nassi RS при входе �
 Name: "firewall"; Description: "Разрешить Nassi RS в брандмауэре Windows (нужно для работы в сети)"; GroupDescription: "Дополнительно:"
 
 [Files]
-; x64 Windows -> 64-bit build
-Source: "{#Root}\target\dist\x86_64-pc-windows-msvc\release\nassi-rs.exe"; DestDir: "{app}"; DestName: "{#AppExe}"; Check: Is64BitInstallMode; Flags: ignoreversion
-; x86 Windows -> 32-bit build
-Source: "{#Root}\target\dist\i686-pc-windows-msvc\release\nassi-rs.exe"; DestDir: "{app}"; DestName: "{#AppExe}"; Check: not Is64BitInstallMode; Flags: ignoreversion
+; 64-bit Windows 10/11 -> 64-bit build
+Source: "{#Root}\target\dist\x86_64-pc-windows-msvc\release\nassi-rs.exe"; DestDir: "{app}"; DestName: "{#AppExe}"; Check: Is64BitInstallMode and IsWin10OrLater; Flags: ignoreversion
+; 64-bit Windows 7 SP1 / 8 / 8.1 -> 64-bit build for Windows 7
+Source: "{#Root}\target\dist\x86_64-win7-windows-msvc\release\nassi-rs.exe"; DestDir: "{app}"; DestName: "{#AppExe}"; Check: Is64BitInstallMode and not IsWin10OrLater; Flags: ignoreversion
+; 32-bit Windows (7 SP1 ... 11) -> 32-bit build (Windows 7 compatible)
+Source: "{#Root}\target\dist\i686-win7-windows-msvc\release\nassi-rs.exe"; DestDir: "{app}"; DestName: "{#AppExe}"; Check: not Is64BitInstallMode; Flags: ignoreversion
 ; emoticons and sounds from the project folder (picked up next to the exe)
 Source: "{#Assets}\Emoticons\*"; DestDir: "{app}\Emoticons"; Flags: recursesubdirs createallsubdirs ignoreversion
 Source: "{#Assets}\Sounds\*"; DestDir: "{app}\Sounds"; Flags: ignoreversion
@@ -72,6 +80,12 @@ Filename: "{app}\{#AppExe}"; Description: "Запустить {#AppName}"; Flags
 
 [UninstallRun]
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#AppName}"""; Flags: runhidden; RunOnceId: "DelFirewallRule"
+
+[Code]
+function IsWin10OrLater: Boolean;
+begin
+  Result := GetWindowsVersion >= $0A000000;
+end;
 
 [Messages]
 russian.WelcomeLabel2=Будет установлен [name/ver].%n%nЛокальный мессенджер (личный, общий и групповой чат, файлы) и удалённое администрирование для системного администратора.%n%nРекомендуется закрыть все другие программы перед продолжением.
