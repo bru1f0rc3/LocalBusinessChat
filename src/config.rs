@@ -66,6 +66,27 @@ pub struct GeneralCfg {
     pub flash_on_message: bool,
     /// seconds without keyboard/mouse input after which I count as "away from the computer"
     pub away_secs: u32,
+    /// how the window is drawn (OpenGL or the CPU); applied at start
+    pub render: RenderMode,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RenderMode {
+    /// OpenGL when the driver supports OpenGL 3.0+, otherwise software
+    #[default]
+    Auto,
+    OpenGl,
+    Software,
+}
+
+impl RenderMode {
+    pub fn title(self) -> &'static str {
+        match self {
+            RenderMode::Auto => "Автоматически",
+            RenderMode::OpenGl => "OpenGL (видеокарта)",
+            RenderMode::Software => "Программная (без видеокарты)",
+        }
+    }
 }
 
 impl Default for GeneralCfg {
@@ -83,6 +104,7 @@ impl Default for GeneralCfg {
             start_minimized: false,
             flash_on_message: true,
             away_secs: 30,
+            render: RenderMode::Auto,
         }
     }
 }

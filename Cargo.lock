@@ -2251,6 +2251,7 @@ dependencies = [
  "chrono",
  "dirs 5.0.1",
  "eframe",
+ "egui-winit",
  "egui_extras",
  "if-addrs",
  "image",

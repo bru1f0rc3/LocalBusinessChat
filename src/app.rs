@@ -376,8 +376,8 @@ fn append_jsonl(path: &std::path::Path, line: &Line) {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, profile: Option<String>) -> App {
-        let ctx = cc.egui_ctx.clone();
+    pub fn new(ctx: &egui::Context, profile: Option<String>) -> App {
+        let ctx = ctx.clone();
         let paths = Paths::new(profile.as_deref());
         let (mut cfg, is_new, cfg_warn) = Config::load(&paths);
         let assets = Paths::find_assets(&cfg);
@@ -465,6 +465,9 @@ impl App {
             app.log(Level::Info, "Настройки", format!("Новый профиль: {}", app.paths.data.display()));
         }
         app.log(Level::Info, "Nassi RS", format!("Nassi RS {} запущен", VERSION));
+        if let Some(r) = crate::RENDER_INFO.get() {
+            app.log(Level::Info, "Отрисовка", r.clone());
+        }
         match &app.assets {
             Some(a) => app.log(Level::Info, "Ресурсы", format!("Смайлы и звуки: {}", a.display())),
             None => app.log(Level::Warn, "Ресурсы", "Папка со смайлами/звуками не найдена (Настройка → Ресурсы)"),

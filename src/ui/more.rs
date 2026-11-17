@@ -557,15 +557,21 @@ impl App {
                         let avail = ui.available_size();
                         let scale = if v.fit { (avail.x / size.x).min(avail.y / size.y).max(0.05) } else { 1.0 };
                         let image = egui::Image::from_texture(SizedTexture::new(tex.id(), size * scale)).sense(Sense::click_and_drag());
-                        let resp = if v.fit {
-                            ui.centered_and_justified(|ui| ui.add(image)).inner
+                        // rect: where the remote screen is actually drawn (mouse mapping and the
+                        // cursor marker are relative to it). In "fit" mode the image is centred
+                        // with black bars around it, so it is not the rect of the whole panel.
+                        let (rect, resp) = if v.fit {
+                            let (area, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+                            let rect = egui::Rect::from_center_size(area.center(), size * scale);
+                            image.paint_at(ui, rect);
+                            (rect, resp)
                         } else {
-                            egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| ui.add(image)).inner
+                            let resp = egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| ui.add(image)).inner;
+                            (resp.rect, resp)
                         };
-                        let rect = resp.rect;
                         // remote cursor marker
                         let cp = rect.min + egui::vec2(cursor.0 as f32, cursor.1 as f32) * scale;
-                        if rect.contains(cp) && !resp.hovered() {
+                        if rect.contains(cp) && !ctx.pointer_hover_pos().is_some_and(|p| rect.contains(p)) {
                             ui.painter().add(egui::Shape::convex_polygon(
                                 vec![cp, cp + egui::vec2(0.0, 16.0), cp + egui::vec2(4.5, 12.0), cp + egui::vec2(11.0, 11.0)],
                                 Color32::WHITE,
@@ -647,7 +653,7 @@ impl App {
                         }
                         let m = ctx.input(|i| i.modifiers);
                         set_mods(v, m);
-                        if resp.hovered() {
+                        if ctx.pointer_hover_pos().is_some_and(|p| rect.contains(p)) {
                             let d = ctx.input(|i| i.raw_scroll_delta);
                             if d != egui::Vec2::ZERO {
                                 v.send(RI::Wheel { dx: (d.x / 50.0 * 120.0) as i32, dy: (d.y / 50.0 * 120.0) as i32 });

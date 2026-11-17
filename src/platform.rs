@@ -420,6 +420,71 @@ mod win {
 #[cfg(windows)]
 pub use win::*;
 
+/// What the OpenGL driver offers: (version, renderer, vendor) of a legacy WGL context,
+/// i.e. the highest compatibility version. Err when there is no usable OpenGL at all.
+#[cfg(windows)]
+pub fn probe_opengl() -> Result<(String, String, String), String> {
+    use windows_sys::Win32::Graphics::Gdi::*;
+    use windows_sys::Win32::Graphics::OpenGL::*;
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+    unsafe fn gl_str(name: u32) -> String {
+        let p = glGetString(name);
+        if p.is_null() {
+            return String::new();
+        }
+        std::ffi::CStr::from_ptr(p as *const std::ffi::c_char).to_string_lossy().trim().to_string()
+    }
+    let class: Vec<u16> = "STATIC".encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let hwnd = CreateWindowExW(0, class.as_ptr(), std::ptr::null(), WS_POPUP, 0, 0, 16, 16, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null());
+        if hwnd.is_null() {
+            return Err("CreateWindowEx failed".into());
+        }
+        let dc = GetDC(hwnd);
+        let mut pfd: PIXELFORMATDESCRIPTOR = std::mem::zeroed();
+        pfd.nSize = std::mem::size_of::<PIXELFORMATDESCRIPTOR>() as u16;
+        pfd.nVersion = 1;
+        pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+        pfd.iPixelType = PFD_TYPE_RGBA;
+        pfd.cColorBits = 32;
+        pfd.iLayerType = PFD_MAIN_PLANE as u8;
+        let mut result = Err("нет подходящего формата пикселей OpenGL".to_string());
+        let pf = ChoosePixelFormat(dc, &pfd);
+        if pf != 0 && SetPixelFormat(dc, pf, &pfd) != 0 {
+            let rc = wglCreateContext(dc);
+            if rc.is_null() {
+                result = Err("wglCreateContext failed".into());
+            } else {
+                if wglMakeCurrent(dc, rc) != 0 {
+                    result = Ok((gl_str(GL_VERSION), gl_str(GL_RENDERER), gl_str(GL_VENDOR)));
+                    wglMakeCurrent(std::ptr::null_mut(), std::ptr::null_mut());
+                } else {
+                    result = Err("wglMakeCurrent failed".into());
+                }
+                wglDeleteContext(rc);
+            }
+        }
+        ReleaseDC(hwnd, dc);
+        DestroyWindow(hwnd);
+        result
+    }
+}
+
+/// Modal error box (the release build has no console to print to).
+pub fn error_box(title: &str, text: &str) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::*;
+        let w = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let (t, m) = (w(title), w(text));
+        unsafe {
+            MessageBoxW(std::ptr::null_mut(), m.as_ptr(), t.as_ptr(), MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+        }
+    }
+    #[cfg(not(windows))]
+    eprintln!("{title}: {text}");
+}
+
 #[cfg(not(windows))]
 mod stub {
     use super::*;

@@ -620,6 +620,13 @@ pub fn chat_input(
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frame(ctx);
+    }
+}
+
+impl App {
+    /// One UI pass of the main window (shared by the OpenGL and the software renderer).
+    pub fn frame(&mut self, ctx: &egui::Context) {
         if let Some(t) = &self.tray {
             if t.show_requested.swap(false, Ordering::Relaxed) {
                 self.visible = true;
@@ -2427,6 +2434,7 @@ impl App {
         let emo_packs = self.emo_packs.clone();
         let assets = self.assets.clone();
         let cur_conn = self.cfg.conn.clone();
+        let cur_render = self.cfg.general.render;
         egui::Window::new("Настройка").collapsible(false).default_size([640.0, 440.0]).resizable(true).show(ctx, |ui| {
             egui::SidePanel::left("setup_pages").resizable(false).exact_width(130.0).show_inside(ui, |ui| {
                 for (i, p) in pages.iter().enumerate() {
@@ -2447,8 +2455,8 @@ impl App {
                     if ui.button("Применить").clicked() {
                         result = Some(2);
                     }
-                    if st.draft.conn != cur_conn {
-                        ui.label(RichText::new("Сетевые настройки применятся после перезапуска").color(Color32::from_rgb(190, 110, 0)));
+                    if st.draft.conn != cur_conn || st.draft.general.render != cur_render {
+                        ui.label(RichText::new("Эти настройки применятся после перезапуска").color(Color32::from_rgb(190, 110, 0)));
                         if ui.button("Сохранить и перезапустить").clicked() {
                             result = Some(3);
                         }
@@ -2462,6 +2470,21 @@ impl App {
                         0 => {
                             ui.checkbox(&mut d.general.close_to_tray, "Кнопка «Закрыть» сворачивает в трей");
                             ui.checkbox(&mut d.general.start_minimized, "Запускаться свёрнутым в трей");
+                            ui.horizontal(|ui| {
+                                ui.label("Отрисовка окна:");
+                                egui::ComboBox::from_id_salt("render_mode").selected_text(d.general.render.title()).show_ui(ui, |ui| {
+                                    for m in [crate::config::RenderMode::Auto, crate::config::RenderMode::OpenGl, crate::config::RenderMode::Software] {
+                                        ui.selectable_value(&mut d.general.render, m, m.title());
+                                    }
+                                });
+                            })
+                            .response
+                            .on_hover_text(
+                                "Программной отрисовке не нужны видеокарта и драйвер OpenGL.\nВключите её, если окно программы не открывается или рисуется с артефактами\n(старые видеокарты, стандартный VGA-драйвер Windows 7, виртуальные машины).\nАвто: OpenGL, если драйвер поддерживает OpenGL 3.0+, иначе программная.",
+                            );
+                            if let Some(r) = crate::RENDER_INFO.get() {
+                                ui.label(RichText::new(format!("    Сейчас: {r}")).weak());
+                            }
                             ui.checkbox(&mut d.general.popup_on_private, "Разворачивать окно и открывать «Личные сообщения» при новом личном сообщении");
                             ui.checkbox(&mut d.general.popup_on_global, "Разворачивать окно при сообщении в общем чате");
                             ui.checkbox(&mut d.general.flash_on_message, "Мигать значком программы, если пришло сообщение, а меня нет на месте")
@@ -2748,7 +2771,7 @@ impl App {
 
     pub fn restart(&mut self) {
         if let Ok(exe) = std::env::current_exe() {
-            let mut args: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with("--delay")).collect();
+            let mut args: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with("--delay") && a != "--software" && a != "--opengl").collect();
             args.push("--delay=1500".into());
             let _ = std::process::Command::new(exe).args(args).spawn();
         }

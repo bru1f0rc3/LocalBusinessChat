@@ -66,6 +66,8 @@ Source: "{#Root}\README.md"; DestDir: "{app}"; DestName: "README.txt"; Flags: ig
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"
+; escape hatch for PCs where OpenGL draws artefacts: CPU rendering, no video driver needed
+Name: "{group}\{#AppName} (программная отрисовка)"; Filename: "{app}\{#AppExe}"; Parameters: "--software"
 Name: "{group}\Удалить {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
