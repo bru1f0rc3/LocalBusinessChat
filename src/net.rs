@@ -80,7 +80,18 @@ pub fn interfaces() -> Vec<(String, Ipv4Addr)> {
     v
 }
 
-fn score(name: &str, ip: Ipv4Addr) -> i32 {
+/// The address Windows would send from to reach the outside world, i.e. the adapter with
+/// the default route. connect() on UDP sends nothing, it only picks the route.
+fn route_ip() -> Option<Ipv4Addr> {
+    let s = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    s.connect((Ipv4Addr::new(8, 8, 8, 8), 53)).ok()?;
+    match s.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) if !ip.is_unspecified() => Some(ip),
+        _ => None,
+    }
+}
+
+fn score(name: &str, ip: Ipv4Addr, route: Option<Ipv4Addr>) -> i32 {
     if ip.is_link_local() || ip.is_unspecified() {
         return -1000;
     }
@@ -106,12 +117,47 @@ fn score(name: &str, ip: Ipv4Addr) -> i32 {
     if name.contains("wi-fi") || name.contains("wlan") || name.contains("wireless") {
         s += 4;
     }
+    // VirtualBox host-only adapter: its default network, and Windows calls it just "Ethernet 3"
+    if ip.octets()[..3] == [192, 168, 56] {
+        s -= 50;
+    }
+    // the adapter with the default route is the real LAN (unless it is a VPN, see above)
+    if route == Some(ip) {
+        s += 15;
+    }
     s
 }
 
 /// Best physical LAN adapter (skips VPN / virtual / link-local).
 pub fn detect_local_ip() -> Option<Ipv4Addr> {
-    interfaces().into_iter().max_by_key(|(n, ip)| score(n, *ip)).map(|(_, ip)| ip)
+    best_ip(interfaces(), route_ip())
+}
+
+fn best_ip(list: Vec<(String, Ipv4Addr)>, route: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
+    list.into_iter().max_by_key(|(n, ip)| score(n, *ip, route)).map(|(_, ip)| ip)
+}
+
+#[cfg(test)]
+mod iface_tests {
+    use super::*;
+
+    #[test]
+    fn real_lan_wins_over_virtualbox_and_vpn() {
+        let list = || {
+            vec![
+                ("Ethernet".to_string(), Ipv4Addr::new(192, 168, 1, 62)),
+                ("Ethernet 3".to_string(), Ipv4Addr::new(192, 168, 56, 1)), // VirtualBox Host-Only
+                ("happ-xray".to_string(), Ipv4Addr::new(172, 19, 0, 1)),
+                ("Bluetooth Network Connection".to_string(), Ipv4Addr::new(169, 254, 130, 33)),
+            ]
+        };
+        let lan = Some(Ipv4Addr::new(192, 168, 1, 62));
+        // VPN holds the default route, no route known, normal default route
+        for route in [Some(Ipv4Addr::new(172, 19, 0, 1)), None, lan] {
+            assert_eq!(best_ip(list(), route), lan, "route {route:?}");
+        }
+        assert_eq!(detect_local_ip().is_some(), !interfaces().is_empty());
+    }
 }
 
 fn udp_socket(ip: Ipv4Addr, port: u16) -> io::Result<Socket> {

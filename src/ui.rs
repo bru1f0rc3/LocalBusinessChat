@@ -13,6 +13,7 @@ use std::time::Duration;
 
 mod more;
 mod private;
+mod received;
 
 const VIEWBAR_BG: Color32 = Color32::from_rgb(0x6e, 0x6e, 0x6e);
 const HEADER_BG: Color32 = Color32::from_rgb(0x8c, 0x8c, 0x8c);
@@ -707,6 +708,7 @@ impl App {
         });
         self.info_windows(ctx, &mut acts);
         self.transfers_window(ctx, &mut acts);
+        self.received_window(ctx, &mut acts);
         self.setup_window(ctx);
         self.dialogs(ctx, &mut acts);
         self.remote_dialogs(ctx, &mut acts);
@@ -1193,6 +1195,10 @@ impl App {
                     ui.separator();
                     if ui.button("Передачи файлов…").clicked() {
                         self.dlg.transfers = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("История принятых файлов…").clicked() {
+                        self.open_received();
                         ui.close_menu();
                     }
                     if ui.button("Папка принятых файлов").clicked() {
@@ -2430,7 +2436,9 @@ impl App {
     fn setup_window(&mut self, ctx: &egui::Context) {
         let Some(st) = &mut self.dlg.setup else { return };
         let mut result: Option<u8> = None; // 0 cancel, 1 ok, 2 apply, 3 restart
-        let pages = ["Общие", "Соединение", "Приватность", "Удалённый доступ", "Чат", "Звуки", "Отсутствие", "Ресурсы", "Колонки"];
+        let pages = ["Общие", "Соединение", "Приватность", "Удалённый доступ", "Чат", "Звуки", "Отсутствие", "Ресурсы", "Колонки", "Обновление"];
+        let upd_status = self.updater.status.clone();
+        let mut upd_check: Option<String> = None;
         let emo_packs = self.emo_packs.clone();
         let assets = self.assets.clone();
         let cur_conn = self.cfg.conn.clone();
@@ -2473,14 +2481,14 @@ impl App {
                             ui.horizontal(|ui| {
                                 ui.label("Отрисовка окна:");
                                 egui::ComboBox::from_id_salt("render_mode").selected_text(d.general.render.title()).show_ui(ui, |ui| {
-                                    for m in [crate::config::RenderMode::Auto, crate::config::RenderMode::OpenGl, crate::config::RenderMode::Software] {
+                                    for m in [crate::config::RenderMode::Software, crate::config::RenderMode::Auto, crate::config::RenderMode::OpenGl] {
                                         ui.selectable_value(&mut d.general.render, m, m.title());
                                     }
                                 });
                             })
                             .response
                             .on_hover_text(
-                                "Программной отрисовке не нужны видеокарта и драйвер OpenGL.\nВключите её, если окно программы не открывается или рисуется с артефактами\n(старые видеокарты, стандартный VGA-драйвер Windows 7, виртуальные машины).\nАвто: OpenGL, если драйвер поддерживает OpenGL 3.0+, иначе программная.",
+                                "Программная (по умолчанию) — окно рисует процессор, видеокарта и драйвер OpenGL не нужны.\nOpenGL — через видеокарту; на старых драйверах (встроенная Intel на Windows 7)\nокно рисуется с артефактами.\nАвтоматически: OpenGL, если драйвер прошёл проверку, иначе программная.\nПрименяется после перезапуска программы.",
                             );
                             if let Some(r) = crate::RENDER_INFO.get() {
                                 ui.label(RichText::new(format!("    Сейчас: {r}")).weak());
@@ -2720,11 +2728,35 @@ impl App {
                                 d.columns = default_columns();
                             }
                         }
+                        9 => {
+                            ui.label(format!("Установлена версия {}", crate::proto::VERSION));
+                            ui.add_space(4.0);
+                            ui.checkbox(&mut d.general.auto_update, "Обновляться автоматически из общей папки")
+                                .on_hover_text("При запуске и затем раз в час программа ищет в папке установщик\nNassiRS-Setup-<версия>.exe новее установленной. Если нашла — тихо\nустанавливает его (без прав администратора) и перезапускается.\nПока идёт передача файла или удалённый сеанс, обновление ждёт;\nво время работы — пока окно программы не используется.");
+                            ui.horizontal(|ui| {
+                                ui.label("Папка с обновлениями:");
+                                ui.add(egui::TextEdit::singleline(&mut d.general.update_dir).desired_width(320.0).hint_text(crate::update::DEFAULT_DIR));
+                                if ui.small_button("По умолчанию").clicked() {
+                                    d.general.update_dir = crate::update::DEFAULT_DIR.to_string();
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                if ui.button("Проверить сейчас").on_hover_text("Найдёт новую версию в указанной папке и сразу её установит").clicked() {
+                                    upd_check = Some(d.general.update_dir.clone());
+                                }
+                                ui.label(RichText::new(&upd_status).weak());
+                            });
+                            ui.add_space(6.0);
+                            ui.label(RichText::new("Чтобы выпустить обновление, положите в эту папку файл NassiRS-Setup-<версия>.exe\n(installer\\build-installer.ps1 -Publish делает это сам).").weak());
+                        }
                         _ => {}
                     }
                 });
             });
         });
+        if let Some(dir) = upd_check {
+            self.check_update_now(&dir);
+        }
         if let Some(r) = result {
             if r == 0 {
                 self.dlg.setup = None;

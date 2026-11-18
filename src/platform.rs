@@ -70,6 +70,21 @@ mod win {
         }
     }
 
+    /// Windows build number (7601 = Windows 7 SP1, 9600 = 8.1, 10240+ = 10/11), 0 if unknown.
+    pub fn windows_build() -> u32 {
+        unsafe {
+            let key = wide("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion");
+            let val = wide("CurrentBuild");
+            let mut buf = [0u16; 64];
+            let mut size = (buf.len() * 2) as u32;
+            if RegGetValueW(HKEY_LOCAL_MACHINE, key.as_ptr(), val.as_ptr(), RRF_RT_REG_SZ, null_mut(), buf.as_mut_ptr() as *mut _, &mut size) != 0 {
+                return 0;
+            }
+            let n = (size as usize / 2).saturating_sub(1);
+            String::from_utf16_lossy(&buf[..n]).trim().parse().unwrap_or(0)
+        }
+    }
+
     pub fn os_name() -> String {
         let read = |name: &str| -> Option<String> {
             unsafe {
@@ -375,6 +390,86 @@ mod win {
         (h != 0).then_some(h)
     }
 
+    /// Context menu of the tray icon. Blocks until the menu is closed; returns the index of
+    /// the chosen item. Done as Microsoft documents it for notification-area menus: the
+    /// owner is an ordinary (hidden) window of ours that is made the foreground window first,
+    /// otherwise the menu does not close when the user clicks elsewhere; WM_NULL afterwards
+    /// makes the next menu work too (KB135788).
+    pub fn tray_popup_menu(items: &[&str]) -> Option<usize> {
+        use std::sync::atomic::{AtomicIsize, Ordering};
+        static OWNER: AtomicIsize = AtomicIsize::new(0);
+        unsafe {
+            let mut owner = OWNER.load(Ordering::Relaxed) as HWND;
+            if owner.is_null() || IsWindow(owner) == 0 {
+                let class = wide("STATIC");
+                let title = wide("Nassi RS tray menu");
+                owner = CreateWindowExW(WS_EX_TOOLWINDOW, class.as_ptr(), title.as_ptr(), WS_POPUP, 0, 0, 0, 0, null_mut(), null_mut(), null_mut(), std::ptr::null());
+                if owner.is_null() {
+                    return None;
+                }
+                OWNER.store(owner as isize, Ordering::Relaxed);
+            }
+            let menu = CreatePopupMenu();
+            if menu.is_null() {
+                return None;
+            }
+            for (i, t) in items.iter().enumerate() {
+                let w = wide(t);
+                AppendMenuW(menu, MF_STRING, i + 1, w.as_ptr());
+            }
+            SetMenuDefaultItem(menu, 1, 0);
+            let mut p = POINT { x: 0, y: 0 };
+            GetCursorPos(&mut p);
+            SetForegroundWindow(owner);
+            let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_RIGHTALIGN, p.x, p.y, 0, owner, std::ptr::null());
+            PostMessageW(owner, WM_NULL, 0, 0);
+            DestroyMenu(menu);
+            (cmd > 0).then(|| cmd as usize - 1)
+        }
+    }
+
+    /// One running copy per profile (`key`). Ok(event): this is the only copy; the event is
+    /// signalled whenever the program is started again (see App::listen_for_second_start).
+    /// Ok(0): could not tell, just run. Err(()): a copy is already running and has been asked
+    /// to show its window. `wait_ms`: after a restart or an update the new copy starts while
+    /// the old one is still closing, so wait for it that long before giving up.
+    pub fn single_instance(key: &str, wait_ms: u64) -> Result<isize, ()> {
+        let mutex_name = wide(&format!("Local\\NassiRS-{key}"));
+        let event_name = wide(&format!("Local\\NassiRS-{key}-show"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+        unsafe {
+            loop {
+                let m = CreateMutexW(std::ptr::null(), 0, mutex_name.as_ptr());
+                if m.is_null() {
+                    return Ok(0);
+                }
+                if GetLastError() != ERROR_ALREADY_EXISTS {
+                    // the mutex handle stays open until the process ends
+                    let ev = CreateEventW(std::ptr::null(), 0, 0, event_name.as_ptr());
+                    return Ok(ev as isize);
+                }
+                CloseHandle(m);
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            let ev = OpenEventW(EVENT_MODIFY_STATE, 0, event_name.as_ptr());
+            if !ev.is_null() {
+                // we were started by the user, so we may give the foreground to the running copy
+                AllowSetForegroundWindow(ASFW_ANY);
+                SetEvent(ev);
+                CloseHandle(ev);
+            }
+            Err(())
+        }
+    }
+
+    /// Blocks until the program is started again (the event of single_instance).
+    pub fn wait_second_start(ev: isize) -> bool {
+        unsafe { WaitForSingleObject(ev as HANDLE, INFINITE) == WAIT_OBJECT_0 }
+    }
+
     /// Blink the taskbar button and the caption until `on == false` (FLASHW_STOP).
     pub fn flash_window(hwnd: isize, on: bool) {
         let fi = FLASHWINFO {
@@ -386,6 +481,20 @@ mod win {
         };
         unsafe {
             FlashWindowEx(&fi);
+        }
+    }
+
+    /// Leave tray mode straight into the taskbar: the window gets its taskbar button back
+    /// but stays minimized and is not activated, so it neither appears on screen nor takes
+    /// the focus away from what the user is doing.
+    pub fn show_in_taskbar(hwnd: isize) {
+        let h = hwnd as HWND;
+        let bits = (WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW) as isize;
+        unsafe {
+            let ex = get_ex(h);
+            ShowWindow(h, SW_HIDE);
+            set_ex(h, ex & !bits);
+            ShowWindow(h, SW_SHOWMINNOACTIVE);
         }
     }
 
@@ -502,6 +611,9 @@ mod stub {
     pub fn play_wav(_p: &std::path::Path) {}
     pub fn find_main_window() -> Option<isize> { None }
     pub fn set_stealth(_h: isize, _on: bool) {}
+    pub fn show_in_taskbar(_h: isize) {}
+    pub fn single_instance(_key: &str, _wait_ms: u64) -> Result<isize, ()> { Ok(0) }
+    pub fn wait_second_start(_ev: isize) -> bool { false }
     pub fn flash_window(_h: isize, _on: bool) {}
     pub fn is_stealth(_h: isize) -> bool { true }
     pub fn capture(_m: usize) -> Result<(image::RgbaImage, i32, i32, usize), String> { Err("unsupported".into()) }

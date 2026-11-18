@@ -3,6 +3,7 @@
 use eframe::egui;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Arc;
+#[cfg(not(windows))]
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
@@ -17,7 +18,8 @@ pub struct Tray {
     pub hwnd: Arc<AtomicIsize>,
 }
 
-fn restore(ctx: &egui::Context, hwnd: &AtomicIsize, show: &AtomicBool) {
+/// Bring the main window back (from the tray, minimized or behind other windows).
+pub fn restore(ctx: &egui::Context, hwnd: &AtomicIsize, show: &AtomicBool) {
     show.store(true, Ordering::Relaxed);
     let h = hwnd.load(Ordering::Relaxed);
     if h != 0 {
@@ -58,34 +60,51 @@ impl Tray {
         let alert_icon = alert_rgba(&data.rgba, data.width, data.height).and_then(|v| tray_icon::Icon::from_rgba(v, data.width, data.height).ok());
         let normal = tray_icon::Icon::from_rgba(data.rgba.clone(), data.width, data.height).ok();
         let icon = tray_icon::Icon::from_rgba(data.rgba, data.width, data.height).ok()?;
-        let menu = Menu::new();
-        let open = MenuItem::new("Открыть Nassi RS", true, None);
-        let quit = MenuItem::new("Выход", true, None);
-        menu.append(&open).ok()?;
-        menu.append(&quit).ok()?;
-        let tray = TrayIconBuilder::new()
-            .with_tooltip("Nassi RS")
-            .with_icon(icon)
-            .with_menu(Box::new(menu))
-            .with_menu_on_left_click(false)
-            .build()
-            .ok()?;
+        #[cfg_attr(windows, allow(unused_mut))]
+        let mut builder = TrayIconBuilder::new().with_tooltip("Nassi RS").with_icon(icon);
+        // Windows: no tray-icon menu. It is opened from the library's hidden window with
+        // WS_EX_NOACTIVATE, which on Windows 7 cannot become the foreground window: the menu
+        // then does not close when you click elsewhere (e.g. on Start), and while it is open
+        // the program's main thread sits in the menu loop, so the program hangs. We show our
+        // own menu instead (platform::tray_popup_menu), the way Microsoft documents it.
+        #[cfg(not(windows))]
+        let (open, quit) = {
+            let menu = Menu::new();
+            let open = MenuItem::new("Открыть Nassi RS", true, None);
+            let quit = MenuItem::new("Выход", true, None);
+            menu.append(&open).ok()?;
+            menu.append(&quit).ok()?;
+            builder = builder.with_menu(Box::new(menu)).with_menu_on_left_click(false);
+            (open, quit)
+        };
+        let tray = builder.build().ok()?;
 
         let show = Arc::new(AtomicBool::new(false));
         let quit_flag = Arc::new(AtomicBool::new(false));
         let hwnd = Arc::new(AtomicIsize::new(0));
         {
-            let (ctx, show, hwnd) = (ctx.clone(), show.clone(), hwnd.clone());
+            let (ctx, show, hwnd, q) = (ctx.clone(), show.clone(), hwnd.clone(), quit_flag.clone());
             TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
-                if matches!(
-                    e,
+                match e {
                     TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. }
-                        | TrayIconEvent::DoubleClick { button: MouseButton::Left, .. }
-                ) {
-                    restore(&ctx, &hwnd, &show);
+                    | TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => restore(&ctx, &hwnd, &show),
+                    #[cfg(windows)]
+                    TrayIconEvent::Click { button: MouseButton::Right, button_state: MouseButtonState::Up, .. } => {
+                        match crate::platform::tray_popup_menu(&["Открыть Nassi RS", "Выход"]) {
+                            Some(0) => restore(&ctx, &hwnd, &show),
+                            Some(1) => {
+                                q.store(true, Ordering::Relaxed);
+                                ctx.request_repaint();
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
                 }
+                let _ = &q;
             }));
         }
+        #[cfg(not(windows))]
         {
             let (ctx, show, q, hwnd) = (ctx.clone(), show.clone(), quit_flag.clone(), hwnd.clone());
             let (open_id, quit_id) = (open.id().clone(), quit.id().clone());

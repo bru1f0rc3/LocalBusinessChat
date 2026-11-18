@@ -1,6 +1,6 @@
 ﻿[package]
 name = "nassi-rs"
-version = "0.2.0"
+version = "0.2.6"
 edition = "2021"
 description = "Serverless LAN messenger (users list, global chat, private chats, file transfer) - a Rust re-implementation inspired by Network Assistant"
 license = "MIT"
@@ -29,6 +29,10 @@ sha2 = "0.10"
 chacha20poly1305 = "0.10"
 tray-icon = "0.19"
 
+[features]
+# only for running the program on Linux (development / tests): X11 window support
+linux-x11 = ["eframe/x11"]
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
@@ -37,6 +41,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_SystemInformation",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
+    # CreateMutexW / CreateEventW (single instance) take SECURITY_ATTRIBUTES
+    "Win32_Security",
     "Win32_System_Registry",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_OpenGL",
@@ -51,6 +57,12 @@ windows_x86_64_msvc = "=0.48.5"
 
 [target.'cfg(all(windows, target_env = "msvc", target_arch = "x86"))'.dependencies]
 windows_i686_msvc = "=0.48.5"
+
+[target.'cfg(all(windows, target_env = "gnu", target_arch = "x86_64"))'.dependencies]
+windows_x86_64_gnu = "=0.48.5"
+
+[target.'cfg(all(windows, target_env = "gnu", target_arch = "x86"))'.dependencies]
+windows_i686_gnu = "=0.48.5"
 
 [build-dependencies]
 winresource = "0.1"

@@ -257,6 +257,8 @@ pub struct Dialogs {
     pub power: Option<(u64, u8, String)>,
     /// "clear private history with uid?" confirmation
     pub clear_chat: Option<u64>,
+    /// Действия → «История принятых файлов» (open while Some)
+    pub received: Option<crate::received::Filter>,
 }
 
 pub struct App {
@@ -306,6 +308,8 @@ pub struct App {
     pub infos: HashMap<u64, InfoWin>,
     pub pending: HashMap<u64, Pending>,
     pub transfers: Vec<Transfer>,
+    /// history of received files (src/received.rs), oldest first
+    pub received: Vec<crate::received::Received>,
     pub events: Vec<EventRec>,
     pub events_unread: bool,
     pub tips: VecDeque<Tip>,
@@ -329,6 +333,7 @@ pub struct App {
     pub os_user: String,
     pub tray: Option<crate::tray::Tray>,
     pub main_pos: Option<egui::Pos2>,
+    pub updater: crate::update::Updater,
     next_event_n: u32,
 }
 
@@ -423,6 +428,7 @@ impl App {
             infos: HashMap::new(),
             pending: HashMap::new(),
             transfers: Vec::new(),
+            received: Vec::new(),
             events: Vec::new(),
             events_unread: false,
             tips: VecDeque::new(),
@@ -445,6 +451,7 @@ impl App {
             os_user: crate::platform::os_user(),
             tray: None,
             main_pos: None,
+            updater: crate::update::Updater::default(),
             next_event_n: 1,
             cfg: Config::default(),
         };
@@ -475,6 +482,7 @@ impl App {
         app.load_emoticons();
 
         // history
+        app.received = crate::received::load(&app.paths);
         app.global = read_jsonl(&app.paths.global, app.cfg.chat.history_lines);
         app.global_ids = app.global.iter().map(|l| l.id).collect();
         if let Ok(rd) = std::fs::read_dir(&app.paths.chats) {
@@ -634,12 +642,21 @@ impl App {
     }
 
     fn start_flash(&mut self) {
+        let hwnd = self.main_hwnd().filter(|_| cfg!(windows));
         if !self.visible {
-            return; // in the tray: only the tray icon blinks (see update_alert)
+            // in the tray: bring the window back to the taskbar, minimized and not
+            // activated, so the user sees the blinking button but is not interrupted
+            // (no window pops up on the screen, the focus stays where it is)
+            if let Some(h) = hwnd {
+                crate::platform::show_in_taskbar(h);
+                self.visible = true;
+                self.minimized = true;
+            }
+            // elsewhere the tray mode is a minimized window, it is in the taskbar already
         }
-        match self.main_hwnd() {
-            Some(h) if cfg!(windows) => crate::platform::flash_window(h, true),
-            _ => self.ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical)),
+        match hwnd {
+            Some(h) => crate::platform::flash_window(h, true),
+            None => self.ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical)),
         }
         self.alert_flashing = true;
     }
@@ -691,6 +708,37 @@ impl App {
         self.minimized = false;
         self.ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         self.ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    /// The program was started again while this copy runs (see platform::single_instance):
+    /// show this window instead. One thread for the whole process; a second App (the OpenGL
+    /// self-test failed and the window was recreated) just takes over as the target.
+    pub fn listen_for_second_start(&self, ev: isize) {
+        use std::sync::atomic::{AtomicBool, AtomicIsize};
+        use std::sync::{Mutex, Once};
+        type Target = (egui::Context, Arc<AtomicIsize>, Arc<AtomicBool>);
+        static TARGET: Mutex<Option<Target>> = Mutex::new(None);
+        static START: Once = Once::new();
+        if ev == 0 {
+            return;
+        }
+        let (hwnd, show) = match &self.tray {
+            Some(t) => (t.hwnd.clone(), t.show_requested.clone()),
+            None => (Arc::new(AtomicIsize::new(0)), Arc::new(AtomicBool::new(false))),
+        };
+        if let Ok(mut t) = TARGET.lock() {
+            *t = Some((self.ctx.clone(), hwnd, show));
+        }
+        START.call_once(|| {
+            let _ = std::thread::Builder::new().name("second-start".into()).spawn(move || {
+                while crate::platform::wait_second_start(ev) {
+                    let t = TARGET.lock().ok().and_then(|t| t.clone());
+                    if let Some((ctx, hwnd, show)) = t {
+                        crate::tray::restore(&ctx, &hwnd, &show);
+                    }
+                }
+            });
+        });
     }
 
     /// Go to the tray. The window stays alive (transparent) so networking keeps working.
@@ -866,6 +914,7 @@ impl App {
             return;
         }
         self.last_tick = now;
+        self.update_tick();
 
         // auto away / return
         let idle = crate::platform::idle_secs();
@@ -1919,7 +1968,21 @@ impl App {
                         } else {
                             format!("Файл «{}» отправлен {}", t.name, t.nick)
                         };
+                        let rec = t.incoming.then(|| crate::received::Received {
+                            time: chrono::Local::now().timestamp(),
+                            from: t.peer,
+                            nick: t.nick.clone(),
+                            computer: String::new(),
+                            name: t.name.clone(),
+                            size: t.size,
+                            path: t.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+                        });
                         self.log(Level::Info, "Файлы", msg);
+                        if let Some(mut rec) = rec {
+                            rec.computer = self.peers.get(&rec.from).map(|p| p.p.computer.clone()).unwrap_or_default();
+                            crate::received::append(&self.paths, &rec);
+                            self.received.push(rec);
+                        }
                     }
                 }
             }

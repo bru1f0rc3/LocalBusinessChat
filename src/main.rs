@@ -3,14 +3,17 @@
 mod app;
 mod config;
 mod emoticons;
+mod gltest;
 mod icons;
 mod net;
 mod platform;
 mod proto;
+mod received;
 mod remote;
 mod soft;
 mod tray;
 mod ui;
+mod update;
 
 use eframe::egui;
 use std::sync::{Arc, OnceLock};
@@ -56,7 +59,7 @@ fn setup_fonts(ctx: &egui::Context) {
 /// OpenGL good enough for egui_glow? Ok(description) or Err(reason to draw in software).
 /// Old drivers with OpenGL 2.x are where egui_glow draws artefacts, and the standard VGA
 /// driver of Windows 7 (and VMs without 3D) only has Microsoft's OpenGL 1.1 "GDI Generic".
-fn check_opengl() -> Result<String, String> {
+fn check_opengl(broken_file: &std::path::Path) -> Result<String, String> {
     #[cfg(windows)]
     {
         let (ver, renderer, vendor) = platform::probe_opengl().map_err(|e| format!("OpenGL недоступен ({e})"))?;
@@ -70,10 +73,28 @@ fn check_opengl() -> Result<String, String> {
         if (major, minor) < (3, 0) {
             return Err(format!("старый драйвер OpenGL (нужен 3.0+) — {desc}"));
         }
+        // Intel integrated graphics on Windows 7/8.x (HD 2000…4600: Sandy/Ivy Bridge, Haswell;
+        // e.g. Pentium G2020): the drivers for these systems are no longer updated and
+        // draw egui with artefacts — stretched triangles and stripes of text over a dark
+        // window — whatever OpenGL version they report. The CPU renderer is fast enough.
+        let intel = vendor.contains("Intel") || renderer.contains("Intel");
+        if intel && platform::windows_build() < 10240 {
+            return Err(format!("встроенная графика Intel на Windows 7/8 рисует через OpenGL с искажениями — {desc}"));
+        }
+        if intel && (major, minor) < (3, 3) {
+            return Err(format!("драйвер Intel с OpenGL {major}.{minor} рисует с искажениями — {desc}"));
+        }
+        // the self-test (gltest) already failed on this driver: do not try it again
+        if std::fs::read_to_string(broken_file).is_ok_and(|s| s.lines().next() == Some(desc.as_str())) {
+            return Err(format!("драйвер OpenGL не прошёл проверку отрисовки — {desc}"));
+        }
         Ok(desc)
     }
     #[cfg(not(windows))]
-    Ok("OpenGL".into())
+    {
+        let _ = broken_file;
+        Ok("OpenGL".into())
+    }
 }
 
 fn main() {
@@ -104,6 +125,16 @@ fn run() -> Result<(), String> {
         std::thread::sleep(std::time::Duration::from_millis(ms.min(30_000)));
     }
     let profile = arg_value(&args, "--profile");
+    // only one copy per profile: started again, it just shows the running one. After a
+    // restart or an update (they pass --delay) wait until the old copy has closed.
+    let instance_key = match &profile {
+        Some(p) => format!("profile-{}", p.replace(['\\', '/', ':'], "_")),
+        None => "main".to_string(),
+    };
+    let wait_ms = if arg_value(&args, "--delay").is_some() { 20_000 } else { 0 };
+    let Ok(instance_event) = platform::single_instance(&instance_key, wait_ms) else {
+        return Ok(());
+    };
     let paths = config::Paths::new(profile.as_deref());
     let (cfg, _, _) = config::Config::load(&paths);
 
@@ -129,6 +160,7 @@ fn run() -> Result<(), String> {
     }
 
     use config::RenderMode;
+    let gl_broken_file = paths.data.join("opengl-broken.txt");
     let gl_error = std::env::var("NASSI_GL_ERROR").ok();
     let mode = if args.iter().any(|a| a == "--software") {
         RenderMode::Software
@@ -139,19 +171,22 @@ fn run() -> Result<(), String> {
     };
     let (software, info) = match (mode, gl_error) {
         (RenderMode::Software, Some(e)) => (true, format!("программная — OpenGL не запустился: {e}")),
-        (RenderMode::Software, None) => (true, "программная (выбрана в настройках или ключом --software)".to_string()),
+        (RenderMode::Software, None) => (true, "программная (по умолчанию; OpenGL можно включить в Настройка → Общие → «Отрисовка окна»)".to_string()),
         (RenderMode::OpenGl, _) => (false, "OpenGL (выбран в настройках или ключом --opengl)".to_string()),
-        (RenderMode::Auto, _) => match check_opengl() {
+        (RenderMode::Auto, _) => match check_opengl(&gl_broken_file) {
             Ok(desc) => (false, desc),
             Err(why) => (true, format!("программная — {why}")),
         },
     };
     let _ = RENDER_INFO.set(info);
 
+    let start_tray = args.iter().any(|a| a == "--tray");
     let make_app = move |ctx: &egui::Context| {
         setup_fonts(ctx);
         let mut app = app::App::new(ctx, profile);
-        if app.cfg.general.start_minimized && app.tray.is_some() && pos.is_none() {
+        app.listen_for_second_start(instance_event);
+        // --tray: restarted by an update while it was in the tray (src/update.rs)
+        if (app.cfg.general.start_minimized || start_tray) && app.tray.is_some() && pos.is_none() {
             app.start_hidden = true;
         }
         app
@@ -160,6 +195,7 @@ fn run() -> Result<(), String> {
     if software {
         return soft::run(vp, Box::new(make_app)).map_err(|e| format!("Не удалось открыть окно программы: {e}"));
     }
+    let self_test = mode == RenderMode::Auto;
     let options = eframe::NativeOptions { viewport: vp, ..Default::default() };
     use std::sync::atomic::Ordering::SeqCst;
     GL_STARTING.store(true, SeqCst);
@@ -168,6 +204,17 @@ fn run() -> Result<(), String> {
             "nassi-rs",
             options,
             Box::new(move |cc| {
+                // "Автоматически": make sure the driver really draws correctly; if not,
+                // remember it and restart with the software renderer (below)
+                if self_test {
+                    if let Some(gl) = &cc.gl {
+                        if let Err(e) = gltest::run(gl) {
+                            let desc = RENDER_INFO.get().cloned().unwrap_or_default();
+                            let _ = std::fs::write(&gl_broken_file, format!("{desc}\n{e}\n"));
+                            return Err(e.into());
+                        }
+                    }
+                }
                 GL_STARTING.store(false, SeqCst);
                 Ok(Box::new(make_app(&cc.egui_ctx)))
             }),

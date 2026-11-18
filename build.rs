@@ -1,8 +1,8 @@
 fn main() {
     println!("cargo:rerun-if-changed=assets/app.ico");
     win7_import_libs();
-    #[cfg(windows)]
-    {
+    // the target, not the host: the program can also be cross-built (mingw) from Linux
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/app.ico");
         res.set("FileDescription", "Nassi RS — LAN messenger");
@@ -10,29 +10,39 @@ fn main() {
         // Common Controls v6 (tray / menu subclassing on Windows 7) and the supported
         // Windows versions: 7, 8, 8.1, 10/11.
         res.set_manifest(MANIFEST);
+        // cross-build from Linux: use the mingw tools of the target architecture
+        if !cfg!(windows) && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
+            let prefix = if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86") { "i686-w64-mingw32" } else { "x86_64-w64-mingw32" };
+            res.set_windres_path(&format!("{prefix}-windres"));
+            res.set_ar_path(&format!("{prefix}-ar"));
+        }
         if let Err(e) = res.compile() {
             println!("cargo:warning=icon resource not embedded: {e}");
         }
     }
 }
 
-/// Windows 7/8.1 builds (*-win7-windows-msvc): windows-targets 0.48 only adds its import
+/// Windows 7/8.1 builds (*-win7-windows-msvc/gnu): windows-targets 0.48 only adds its import
 /// library for the usual target names, so point the linker at it ourselves. The crate is a
 /// direct dependency (Cargo.toml), so it is always unpacked in the cargo registry.
 fn win7_import_libs() {
     let target = std::env::var("TARGET").unwrap_or_default();
-    if !target.ends_with("-win7-windows-msvc") {
-        return;
-    }
-    let krate = if target.starts_with("x86_64") { "windows_x86_64_msvc-0.48.5" } else { "windows_i686_msvc-0.48.5" };
+    let (krate, lib) = match target.as_str() {
+        "x86_64-win7-windows-msvc" => ("windows_x86_64_msvc-0.48.5", "windows.0.48.5.lib"),
+        "i686-win7-windows-msvc" => ("windows_i686_msvc-0.48.5", "windows.0.48.5.lib"),
+        "x86_64-win7-windows-gnu" => ("windows_x86_64_gnu-0.48.5", "libwindows.0.48.5.a"),
+        "i686-win7-windows-gnu" => ("windows_i686_gnu-0.48.5", "libwindows.0.48.5.a"),
+        _ => return,
+    };
     let home = std::env::var_os("CARGO_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(|h| std::path::PathBuf::from(h).join(".cargo")));
+        .or_else(|| std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(|h| std::path::PathBuf::from(h).join(".cargo")));
     let Some(home) = home else { return };
     let Ok(rd) = std::fs::read_dir(home.join("registry").join("src")) else { return };
     for e in rd.flatten() {
+        let lib_name = lib;
         let lib = e.path().join(krate).join("lib");
-        if lib.join("windows.0.48.5.lib").exists() {
+        if lib.join(lib_name).exists() {
             println!("cargo:rustc-link-search=native={}", lib.display());
             return;
         }
@@ -40,7 +50,6 @@ fn win7_import_libs() {
     println!("cargo:warning={krate} not found in the cargo registry: linking may fail");
 }
 
-#[cfg(windows)]
 const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity type="win32" name="NassiRS" version="1.0.0.0"/>

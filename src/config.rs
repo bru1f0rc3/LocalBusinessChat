@@ -9,7 +9,7 @@ pub const ST_PRIVATE: u8 = 3;
 pub const ST_AWAY: u8 = 4;
 pub const ST_OFFLINE: u8 = 5;
 pub const MAX_CUSTOM_STATES: usize = 6;
-pub const CFG_VERSION: u32 = 2;
+pub const CFG_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default)]
@@ -68,14 +68,19 @@ pub struct GeneralCfg {
     pub away_secs: u32,
     /// how the window is drawn (OpenGL or the CPU); applied at start
     pub render: RenderMode,
+    /// look for a newer installer in `update_dir` at start and every hour, install it silently
+    pub auto_update: bool,
+    /// shared folder with NassiRS-Setup-<version>.exe (see src/update.rs)
+    pub update_dir: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum RenderMode {
-    /// OpenGL when the driver supports OpenGL 3.0+, otherwise software
-    #[default]
+    /// OpenGL when the driver supports OpenGL 3.0+ and passes the self-test, otherwise software
     Auto,
     OpenGl,
+    /// the default: OpenGL drivers of office PCs (Intel HD on Windows 7) draw egui with artefacts
+    #[default]
     Software,
 }
 
@@ -104,7 +109,9 @@ impl Default for GeneralCfg {
             start_minimized: false,
             flash_on_message: true,
             away_secs: 30,
-            render: RenderMode::Auto,
+            render: RenderMode::Software,
+            auto_update: true,
+            update_dir: crate::update::DEFAULT_DIR.to_string(),
         }
     }
 }
@@ -403,6 +410,10 @@ impl Config {
             // v2: the active window title is visible to others by default
             self.privacy.no_fg_title = false;
         }
+        if self.cfg_version < 3 && self.general.render == RenderMode::Auto {
+            // v3: software rendering by default (it was "Auto" = OpenGL when available)
+            self.general.render = RenderMode::Software;
+        }
         self.cfg_version = CFG_VERSION;
         let def = Config::default();
         if self.uid == 0 {
@@ -480,5 +491,29 @@ impl Config {
 
     pub fn cur_state(&self) -> &StateDef {
         &self.states[self.state as usize]
+    }
+}
+
+#[cfg(test)]
+mod render_default_tests {
+    use super::*;
+
+    #[test]
+    fn software_is_default_and_old_auto_is_migrated() {
+        assert_eq!(Config::default().general.render, RenderMode::Software);
+        let mut old = Config::default();
+        old.cfg_version = 2;
+        old.general.render = RenderMode::Auto;
+        old.fixup();
+        assert_eq!(old.general.render, RenderMode::Software);
+        // an explicit choice made after the update stays
+        let mut c = Config::default();
+        c.general.render = RenderMode::OpenGl;
+        c.fixup();
+        assert_eq!(c.general.render, RenderMode::OpenGl);
+        let mut c = Config::default();
+        c.general.render = RenderMode::Auto;
+        c.fixup();
+        assert_eq!(c.general.render, RenderMode::Auto);
     }
 }

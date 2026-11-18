@@ -6,6 +6,14 @@
 #
 # The *-win7-* targets are tier 3 in Rust: std is compiled from source, which needs
 # the nightly toolchain with rust-src (installed automatically below).
+#
+#   -Publish                 also copy the installer into the update folder; every running
+#   -UpdateDir \\srv\share   Nassi RS finds it there and updates itself (src/update.rs).
+#                            Raise "version" in Cargo.toml first, otherwise nobody updates.
+param(
+    [switch]$Publish,
+    [string]$UpdateDir = '\\server\hole\update'
+)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
@@ -38,3 +46,14 @@ Write-Host "== ISCC (version $ver)"
 & $iscc "/DAppVersion=$ver" "$PSScriptRoot\nassi-rs.iss"
 if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
 Get-ChildItem "$root\dist\*.exe" | Select-Object Name, Length
+
+if ($Publish) {
+    $setup = "$root\dist\NassiRS-Setup-$ver.exe"
+    if (-not (Test-Path $UpdateDir)) { throw "update folder not reachable: $UpdateDir" }
+    # copy under a temporary name, then rename: a program checking right now never sees half a file
+    $tmp = Join-Path $UpdateDir "NassiRS-Setup-$ver.exe.part"
+    Copy-Item $setup $tmp -Force
+    Move-Item $tmp (Join-Path $UpdateDir "NassiRS-Setup-$ver.exe") -Force
+    Write-Host "== published to $UpdateDir"
+    Get-ChildItem (Join-Path $UpdateDir 'NassiRS-Setup-*.exe') | Select-Object Name, Length, LastWriteTime
+}

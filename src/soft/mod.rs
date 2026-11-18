@@ -6,7 +6,7 @@
 //! same features eframe gives the app: several immediate viewports (pop-up tips, the remote
 //! access indicator, remote viewer windows), viewport commands, clipboard, IME, tray mode.
 
-mod raster;
+pub mod raster;
 
 use crate::app::App;
 use eframe::egui;

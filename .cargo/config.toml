@@ -12,3 +12,12 @@ rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.i686-win7-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# Cross-build from Linux with mingw-w64 (Windows 7 SP1+ compatible, no extra DLLs).
+[target.x86_64-win7-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-static"]
+
+[target.i686-win7-windows-gnu]
+linker = "i686-w64-mingw32-gcc"
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-static"]
